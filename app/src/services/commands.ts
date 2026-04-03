@@ -1,0 +1,138 @@
+import { invoke } from '@tauri-apps/api/core';
+import {
+  confirmPaperMetadataResponseSchema,
+  agentRunDetailSchema,
+  importPaperFromFileResponseSchema,
+  libraryItemMutationResponseSchema,
+  libraryListResponseSchema,
+  modelConnectionResponseSchema,
+  modelConfigResponseSchema,
+  paperParseStatusResponseSchema,
+  paperSearchResponseSchema,
+  profileResponseSchema,
+  readerSnapshotSchema,
+  runAgentResponseSchema,
+} from '../schemas/contracts';
+import type {
+  AgentRunDetail,
+  ConfirmPaperMetadataRequest,
+  ConfirmPaperMetadataResponse,
+  GetAgentRunRequest,
+  GetPaperParseStatusRequest,
+  GetReaderSnapshotRequest,
+  ImportPaperFromFileRequest,
+  ImportPaperFromFileResponse,
+  ImportPaperFromLinkRequest,
+  LibraryItemMutationResponse,
+  LibraryListRequest,
+  LibraryListResponse,
+  ModelConfigRequest,
+  ModelConfigResponse,
+  PaperParseStatusResponse,
+  ReaderSnapshot,
+  RunAgentRequest,
+  RunAgentResponse,
+  SaveToLibraryRequest,
+  SearchPapersRequest,
+  SearchPapersResponse,
+  TestModelConnectionRequest,
+  TestModelConnectionResponse,
+  UpdateLibraryItemRequest,
+  UserProfile,
+} from '../types/contracts';
+
+export async function searchPapers(payload: SearchPapersRequest): Promise<SearchPapersResponse> {
+  const response = await invoke('search_papers', { request: payload });
+  return paperSearchResponseSchema.parse(response);
+}
+
+export async function getProfile(): Promise<UserProfile> {
+  const response = await invoke('get_profile');
+  return profileResponseSchema.parse(response);
+}
+
+export async function upsertProfile(payload: UserProfile): Promise<UserProfile> {
+  const response = await invoke('upsert_profile', { request: payload });
+  return profileResponseSchema.parse(response);
+}
+
+export async function saveModelConfig(payload: ModelConfigRequest): Promise<ModelConfigResponse> {
+  const response = await invoke('save_model_config', { request: payload });
+  return modelConfigResponseSchema.parse(response);
+}
+
+export async function testModelConnection(
+  payload: TestModelConnectionRequest,
+): Promise<TestModelConnectionResponse> {
+  const response = await invoke('test_model_connection', { request: payload });
+  return modelConnectionResponseSchema.parse(response);
+}
+
+export async function importPaperFromFile(
+  payload: ImportPaperFromFileRequest,
+): Promise<ImportPaperFromFileResponse> {
+  const response = await invoke('import_paper_from_file', { request: payload });
+  return importPaperFromFileResponseSchema.parse(response);
+}
+
+export async function pickPdfFile(): Promise<string | null> {
+  const response = await invoke<string | null>('pick_pdf_file');
+  return response;
+}
+
+export async function importPaperFromLink(
+  payload: ImportPaperFromLinkRequest,
+): Promise<ImportPaperFromFileResponse> {
+  const response = await invoke('import_paper_from_link', { request: payload });
+  return importPaperFromFileResponseSchema.parse(response);
+}
+
+export async function confirmPaperMetadata(
+  payload: ConfirmPaperMetadataRequest,
+): Promise<ConfirmPaperMetadataResponse> {
+  const response = await invoke('confirm_paper_metadata', { request: payload });
+  return confirmPaperMetadataResponseSchema.parse(response);
+}
+
+export async function getPaperParseStatus(
+  payload: GetPaperParseStatusRequest,
+): Promise<PaperParseStatusResponse> {
+  const response = await invoke('get_paper_parse_status', { request: payload });
+  return paperParseStatusResponseSchema.parse(response);
+}
+
+export async function getReaderSnapshot(
+  payload: GetReaderSnapshotRequest,
+): Promise<ReaderSnapshot> {
+  const response = await invoke('get_reader_snapshot', { request: payload });
+  return readerSnapshotSchema.parse(response);
+}
+
+export async function runAgent(payload: RunAgentRequest): Promise<RunAgentResponse> {
+  const response = await invoke('run_agent', { request: payload });
+  return runAgentResponseSchema.parse(response);
+}
+
+export async function getAgentRun(payload: GetAgentRunRequest): Promise<AgentRunDetail> {
+  const response = await invoke('get_agent_run', { request: payload });
+  return agentRunDetailSchema.parse(response);
+}
+
+export async function listLibraryItems(payload: LibraryListRequest): Promise<LibraryListResponse> {
+  const response = await invoke('list_library_items', { request: payload });
+  return libraryListResponseSchema.parse(response);
+}
+
+export async function saveToLibrary(
+  payload: SaveToLibraryRequest,
+): Promise<LibraryItemMutationResponse> {
+  const response = await invoke('save_to_library', { request: payload });
+  return libraryItemMutationResponseSchema.parse(response);
+}
+
+export async function updateLibraryItem(
+  payload: UpdateLibraryItemRequest,
+): Promise<LibraryItemMutationResponse> {
+  const response = await invoke('update_library_item', { request: payload });
+  return libraryItemMutationResponseSchema.parse(response);
+}

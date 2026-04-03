@@ -1,0 +1,1 @@
+ALTER TABLE model_configs ADD COLUMN api_key_fallback TEXT;

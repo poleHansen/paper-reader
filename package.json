@@ -1,0 +1,12 @@
+{
+  "name": "paper-reader",
+  "private": true,
+  "packageManager": "pnpm@10.0.0",
+  "scripts": {
+    "dev": "corepack pnpm --dir app dev",
+    "build": "corepack pnpm --dir app build",
+    "lint": "corepack pnpm --dir app lint",
+    "tauri:dev": "node app/node_modules/@tauri-apps/cli/tauri.js dev",
+    "tauri:build": "node app/node_modules/@tauri-apps/cli/tauri.js build"
+  }
+}
