@@ -809,7 +809,7 @@ fn load_previous_runs(connection: &rusqlite::Connection, paper_id: &str) -> Resu
 
 fn load_handoff_summaries(connection: &rusqlite::Connection, paper_id: &str) -> Result<Vec<Value>, AppError> {
     let mut statement = connection.prepare(
-        "SELECT stage, compressed_conclusion, key_points_json, carry_forward_questions_json, carry_forward_evidence_json, next_step_suggestion, generated_at
+        "SELECT id, stage, compressed_conclusion, key_points_json, carry_forward_questions_json, carry_forward_evidence_json, next_step_suggestion, generated_at
          FROM agent_handoff_summaries
          WHERE paper_id = ?1
          ORDER BY created_at DESC
@@ -819,13 +819,14 @@ fn load_handoff_summaries(connection: &rusqlite::Connection, paper_id: &str) -> 
     let rows = statement
         .query_map(rusqlite::params![paper_id], |row| {
             Ok(json!({
-                "stage": row.get::<_, String>(0)?,
-                "compressedConclusion": row.get::<_, String>(1)?,
-                "keyPoints": serde_json::from_str::<Vec<String>>(&row.get::<_, String>(2)?).unwrap_or_default(),
-                "carryForwardQuestions": serde_json::from_str::<Vec<String>>(&row.get::<_, String>(3)?).unwrap_or_default(),
-                "carryForwardEvidence": serde_json::from_str::<Vec<EvidenceItem>>(&row.get::<_, String>(4)?).unwrap_or_default(),
-                "nextStepSuggestion": row.get::<_, String>(5)?,
-                "generatedAt": row.get::<_, String>(6)?,
+                "id": row.get::<_, String>(0)?,
+                "stage": row.get::<_, String>(1)?,
+                "compressedConclusion": row.get::<_, String>(2)?,
+                "keyPoints": serde_json::from_str::<Vec<String>>(&row.get::<_, String>(3)?).unwrap_or_default(),
+                "carryForwardQuestions": serde_json::from_str::<Vec<String>>(&row.get::<_, String>(4)?).unwrap_or_default(),
+                "carryForwardEvidence": serde_json::from_str::<Vec<EvidenceItem>>(&row.get::<_, String>(5)?).unwrap_or_default(),
+                "nextStepSuggestion": row.get::<_, String>(6)?,
+                "generatedAt": row.get::<_, String>(7)?,
             }))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -956,9 +957,16 @@ fn build_context_plan(
         .section_strategy
         .clone()
         .unwrap_or_else(|| "agent_default".to_string());
+    let used_handoff_summary_ids = resolve_handoff_summary_ids(request, handoff_summaries);
+    let selected_handoff_summaries = select_handoff_summaries(handoff_summaries, &used_handoff_summary_ids);
     let max_sections_per_batch = request.max_sections_per_batch.unwrap_or(default_max_sections_per_batch(&request.agent_type)).max(1);
     let max_batches = request.max_batches.unwrap_or(3).max(1);
-    let mut selected_sections = select_section_ids_for_agent(&request.agent_type, parsed_content);
+    let mut selected_sections = select_section_ids_for_agent(&request.agent_type, parsed_content, &selected_handoff_summaries);
+    let handoff_chain_complete = handoff_chain_sufficient(&request.agent_type, &selected_handoff_summaries);
+    let gap_categories = gap_categories_for_agent(&request.agent_type, &selected_handoff_summaries, handoff_chain_complete);
+    let backfill_reason = backfill_reason_for_agent(&request.agent_type, handoff_chain_complete, &gap_categories);
+    let handoff_only = selected_sections.is_empty() && !selected_handoff_summaries.is_empty();
+    let mut fallback_applied = false;
 
     if let Some(pinned_section_ids) = request.pinned_section_ids.as_ref() {
         for section_id in pinned_section_ids {
@@ -971,6 +979,7 @@ fn build_context_plan(
     }
 
     if selected_sections.is_empty() {
+        fallback_applied = true;
         selected_sections = parsed_content
             .sections
             .iter()
@@ -985,8 +994,6 @@ fn build_context_plan(
         .into_iter()
         .take((max_sections_per_batch * max_batches) as usize)
         .collect::<Vec<_>>();
-    let used_handoff_summary_ids = resolve_handoff_summary_ids(request, handoff_summaries);
-
     let batches = selected_sections
         .chunks(max_sections_per_batch as usize)
         .enumerate()
@@ -1006,13 +1013,22 @@ fn build_context_plan(
     ContextPlan {
         runtime_mode,
         section_strategy: requested_strategy,
-        selection_reason: selection_reason_for_agent(&request.agent_type),
+        selection_reason: selection_reason_for_agent(
+            &request.agent_type,
+            &selected_handoff_summaries,
+            &selected_sections,
+            handoff_only,
+            fallback_applied,
+        ),
+        handoff_chain_complete,
+        backfill_reason,
+        gap_categories,
         selected_section_ids: selected_sections,
         used_handoff_summary_ids,
         batch_count: batches.len() as i32,
         current_batch_index: 0,
         truncated: truncated_selected,
-        fallback_applied: false,
+        fallback_applied,
         batches,
     }
 }
@@ -1027,18 +1043,170 @@ fn default_max_sections_per_batch(agent_type: &str) -> i32 {
     }
 }
 
-fn selection_reason_for_agent(agent_type: &str) -> String {
+fn selection_reason_for_agent(
+    agent_type: &str,
+    selected_handoff_summaries: &[Value],
+    selected_sections: &[String],
+    handoff_only: bool,
+    fallback_applied: bool,
+) -> String {
+    let handoff_count = selected_handoff_summaries.len();
+    let section_count = selected_sections.len();
+
     match agent_type {
-        "quick_read" => "Prioritize abstract, introduction, method, experiment/results, and conclusion so fast relevance checks still include core evidence and performance signals.".to_string(),
-        "careful_read" => "Prioritize method, experiment, and limitation sections for structured evaluation.".to_string(),
-        "deep_read" => "Prioritize implementation details, experiments, and appendix-style evidence for deep inspection.".to_string(),
-        "summary" => "Prefer handoff summaries first and only keep a small set of anchor sections for evidence backfill.".to_string(),
-        _ => "Use the highest-signal sections for the selected agent type.".to_string(),
+        "quick_read" => format!(
+            "Quick read targets anchor sections for fast relevance screening; {} section(s) selected{}.",
+            section_count,
+            fallback_suffix(fallback_applied)
+        ),
+        "careful_read" => {
+            if fallback_applied {
+                format!(
+                    "Careful read started from {} quick-read handoff summary ids, but no explicit gaps resolved to paper sections, so the planner fell back to the first {} section(s).",
+                    handoff_count,
+                    section_count
+                )
+            } else if section_count > 0 {
+                format!(
+                    "Careful read is handoff-first: {} summary ids narrowed the plan to {} section(s) that backfill unresolved introduction, method, result, or limitation gaps.",
+                    handoff_count,
+                    section_count
+                )
+            } else {
+                format!(
+                    "Careful read is relying on {} handoff summary ids without section backfill because the current handoff already covers the remaining gaps.",
+                    handoff_count
+                )
+            }
+        }
+        "deep_read" => {
+            if fallback_applied {
+                format!(
+                    "Deep read used {} handoff summary ids, but no evidence-linked section match was found, so the planner fell back to the first {} section(s).",
+                    handoff_count,
+                    section_count
+                )
+            } else {
+                format!(
+                    "Deep read used {} handoff summary ids to target {} section(s) referenced by carry-forward questions or evidence{}.",
+                    handoff_count,
+                    section_count,
+                    if handoff_count == 0 { " from the paper structure alone" } else { "" }
+                )
+            }
+        }
+        "summary" => {
+            if handoff_only {
+                format!(
+                    "Summary is handoff-only: {} summary ids provide a complete synthesis chain, so no paper sections were backfilled.",
+                    handoff_count
+                )
+            } else if fallback_applied {
+                format!(
+                    "Summary could not build a complete handoff chain, so it fell back to {} anchor section(s) from the paper.",
+                    section_count
+                )
+            } else {
+                format!(
+                    "Summary used {} handoff summary ids and backfilled {} anchor section(s) because the handoff chain was incomplete.",
+                    handoff_count,
+                    section_count
+                )
+            }
+        }
+        _ => format!(
+            "Used {} handoff summary ids and selected {} high-signal section(s){}.",
+            handoff_count,
+            section_count,
+            fallback_suffix(fallback_applied)
+        ),
     }
 }
 
-fn select_section_ids_for_agent(agent_type: &str, parsed_content: &ParsedPaperContent) -> Vec<String> {
-    let keywords = keywords_for_agent(agent_type);
+fn gap_categories_for_agent(
+    agent_type: &str,
+    selected_handoff_summaries: &[Value],
+    handoff_chain_complete: bool,
+) -> Vec<String> {
+    match agent_type {
+        "quick_read" => vec!["anchor_scan".to_string()],
+        "careful_read" => {
+            let mut categories = extract_careful_read_keywords(selected_handoff_summaries);
+            if categories.is_empty() {
+                categories.extend([
+                    "introduction",
+                    "method",
+                    "experiment",
+                    "discussion",
+                ]
+                .into_iter()
+                .map(str::to_string));
+            }
+            dedupe_strings(categories)
+        }
+        "deep_read" => {
+            let mut categories = extract_deep_read_keywords(selected_handoff_summaries);
+            if categories.is_empty() {
+                categories.extend([
+                    "method",
+                    "experiment",
+                    "appendix",
+                    "discussion",
+                ]
+                .into_iter()
+                .map(str::to_string));
+            }
+            dedupe_strings(categories)
+        }
+        "summary" => {
+            if handoff_chain_complete {
+                vec!["handoff_chain_complete".to_string()]
+            } else {
+                vec!["final_synthesis_gap".to_string(), "anchor_backfill".to_string()]
+            }
+        }
+        _ => vec!["general_signal".to_string()],
+    }
+}
+
+fn backfill_reason_for_agent(
+    agent_type: &str,
+    handoff_chain_complete: bool,
+    gap_categories: &[String],
+) -> Option<String> {
+    match agent_type {
+        "summary" if handoff_chain_complete => None,
+        "careful_read" => Some(format!(
+            "Backfill paper sections only for unresolved gaps: {}.",
+            gap_categories.join(", ")
+        )),
+        "deep_read" => Some(format!(
+            "Backfill sections only when carry-forward evidence points to these targets: {}.",
+            gap_categories.join(", ")
+        )),
+        "summary" => Some("Backfill anchor sections because the handoff chain is incomplete for final synthesis.".to_string()),
+        _ => None,
+    }
+}
+
+fn fallback_suffix(fallback_applied: bool) -> &'static str {
+    if fallback_applied {
+        " after fallback was applied"
+    } else {
+        ""
+    }
+}
+
+fn select_section_ids_for_agent(
+    agent_type: &str,
+    parsed_content: &ParsedPaperContent,
+    selected_handoff_summaries: &[Value],
+) -> Vec<String> {
+    if agent_type == "summary" && handoff_chain_sufficient(agent_type, selected_handoff_summaries) {
+        return Vec::new();
+    }
+
+    let keywords = keywords_for_agent(agent_type, selected_handoff_summaries);
     let mut prioritized = parsed_content
         .sections
         .iter()
@@ -1046,14 +1214,14 @@ fn select_section_ids_for_agent(agent_type: &str, parsed_content: &ParsedPaperCo
         .map(|section| section.id.clone())
         .collect::<Vec<_>>();
 
-    if prioritized.is_empty() {
+    if prioritized.is_empty() && !should_skip_section_fallback(agent_type, selected_handoff_summaries) {
         prioritized = parsed_content.sections.iter().take(6).map(|section| section.id.clone()).collect();
     }
 
     prioritized
 }
 
-fn keywords_for_agent(agent_type: &str) -> Vec<&'static str> {
+fn keywords_for_agent(agent_type: &str, selected_handoff_summaries: &[Value]) -> Vec<String> {
     match agent_type {
         "quick_read" => vec![
             "abstract",
@@ -1067,15 +1235,40 @@ fn keywords_for_agent(agent_type: &str) -> Vec<&'static str> {
             "ablation",
             "result",
             "conclusion",
-        ],
-        "careful_read" => vec!["method", "approach", "experiment", "evaluation", "limitation"],
-        "deep_read" => vec!["method", "implementation", "experiment", "appendix", "ablation"],
-        "summary" => vec!["abstract", "conclusion", "discussion", "result"],
-        _ => vec!["abstract", "introduction", "conclusion"],
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        "careful_read" => {
+            let mut keywords = extract_careful_read_keywords(selected_handoff_summaries);
+            keywords.extend(
+                ["introduction", "method", "approach", "experiment", "evaluation", "limitation", "discussion"]
+                    .into_iter()
+                    .map(str::to_string),
+            );
+            dedupe_strings(keywords)
+        }
+        "deep_read" => {
+            let mut keywords = extract_deep_read_keywords(selected_handoff_summaries);
+            keywords.extend(
+                ["method", "implementation", "experiment", "appendix", "ablation", "discussion"]
+                    .into_iter()
+                    .map(str::to_string),
+            );
+            dedupe_strings(keywords)
+        }
+        "summary" => vec!["abstract", "conclusion", "discussion", "result"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        _ => vec!["abstract", "introduction", "conclusion"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
     }
 }
 
-fn section_matches_keywords(section: &ParsedSection, keywords: &[&str]) -> bool {
+fn section_matches_keywords(section: &ParsedSection, keywords: &[String]) -> bool {
     let title = section.title.to_lowercase();
     keywords.iter().any(|keyword| title.contains(keyword))
 }
@@ -1085,11 +1278,151 @@ fn resolve_handoff_summary_ids(request: &RunAgentRequest, handoff_summaries: &[V
         return ids.clone();
     }
 
-    handoff_summaries
-        .iter()
-        .filter_map(|summary| summary.get("id").and_then(Value::as_str).map(str::to_string))
-        .take(3)
-        .collect()
+    let preferred_stages = preferred_handoff_stages(&request.agent_type);
+    let mut selected_ids = Vec::new();
+
+    for stage in preferred_stages {
+        if let Some(summary_id) = handoff_summaries.iter().find_map(|summary| {
+            let matches_stage = summary
+                .get("stage")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == stage);
+            if matches_stage {
+                summary.get("id").and_then(Value::as_str).map(str::to_string)
+            } else {
+                None
+            }
+        }) {
+            selected_ids.push(summary_id);
+        }
+    }
+
+    if selected_ids.is_empty() {
+        handoff_summaries
+            .iter()
+            .filter_map(|summary| summary.get("id").and_then(Value::as_str).map(str::to_string))
+            .take(3)
+            .collect()
+    } else {
+        selected_ids
+    }
+}
+
+fn preferred_handoff_stages(agent_type: &str) -> Vec<&'static str> {
+    match agent_type {
+        "careful_read" => vec!["quick_read"],
+        "deep_read" => vec!["quick_read", "careful_read"],
+        "summary" => vec!["quick_read", "careful_read", "deep_read"],
+        _ => Vec::new(),
+    }
+}
+
+fn handoff_chain_sufficient(agent_type: &str, selected_handoff_summaries: &[Value]) -> bool {
+    let required = preferred_handoff_stages(agent_type);
+    !required.is_empty()
+        && required.into_iter().all(|stage| {
+            selected_handoff_summaries
+                .iter()
+                .any(|summary| summary.get("stage").and_then(Value::as_str).is_some_and(|value| value == stage))
+        })
+}
+
+fn should_skip_section_fallback(agent_type: &str, selected_handoff_summaries: &[Value]) -> bool {
+    agent_type == "summary" && handoff_chain_sufficient(agent_type, selected_handoff_summaries)
+}
+
+fn extract_careful_read_keywords(selected_handoff_summaries: &[Value]) -> Vec<String> {
+    let mut keywords = Vec::new();
+
+    for summary in selected_handoff_summaries {
+        if summary
+            .get("stage")
+            .and_then(Value::as_str)
+            .is_some_and(|stage| stage == "quick_read")
+        {
+            if let Some(key_points) = summary.get("keyPoints").and_then(Value::as_array) {
+                for point in key_points.iter().filter_map(Value::as_str) {
+                    keywords.extend(normalize_section_signal(point));
+                }
+            }
+
+            if let Some(questions) = summary.get("carryForwardQuestions").and_then(Value::as_array) {
+                for question in questions.iter().filter_map(Value::as_str) {
+                    keywords.extend(normalize_section_signal(question));
+                }
+            }
+
+            if let Some(evidence_items) = summary.get("carryForwardEvidence").and_then(Value::as_array) {
+                for item in evidence_items {
+                    if let Some(section) = item.get("section").and_then(Value::as_str) {
+                        keywords.extend(normalize_section_signal(section));
+                    }
+                }
+            }
+        }
+    }
+
+    dedupe_strings(keywords)
+}
+
+fn extract_deep_read_keywords(selected_handoff_summaries: &[Value]) -> Vec<String> {
+    let mut keywords = Vec::new();
+
+    for summary in selected_handoff_summaries {
+        if let Some(evidence_items) = summary.get("carryForwardEvidence").and_then(Value::as_array) {
+            for item in evidence_items {
+                if let Some(section) = item.get("section").and_then(Value::as_str) {
+                    keywords.extend(normalize_section_signal(section));
+                }
+                if let Some(locator) = item.get("locator").and_then(Value::as_str) {
+                    keywords.extend(normalize_section_signal(locator));
+                }
+            }
+        }
+
+        if let Some(questions) = summary.get("carryForwardQuestions").and_then(Value::as_array) {
+            for question in questions.iter().filter_map(Value::as_str) {
+                keywords.extend(normalize_section_signal(question));
+            }
+        }
+    }
+
+    dedupe_strings(keywords)
+}
+
+fn normalize_section_signal(value: &str) -> Vec<String> {
+    let normalized = value.to_lowercase();
+    let alias_groups = [
+        (&["method", "approach", "framework", "implementation"][..], "method"),
+        (&["experiment", "evaluation", "result", "results", "ablation", "benchmark"][..], "experiment"),
+        (&["discussion", "limitation", "limitations", "threat", "weakness"][..], "discussion"),
+        (&["appendix", "supplementary", "supplement"][..], "appendix"),
+        (&["introduction", "intro", "background", "motivation"][..], "introduction"),
+        (&["conclusion", "future work", "summary"][..], "conclusion"),
+    ];
+
+    let mut matched = Vec::new();
+    for (aliases, canonical) in alias_groups {
+        if aliases.iter().any(|alias| normalized.contains(alias)) {
+            matched.push(canonical.to_string());
+        }
+    }
+
+    if matched.is_empty() && normalized.split_whitespace().count() <= 5 {
+        matched.push(normalized);
+    }
+
+    matched
+}
+
+fn dedupe_strings(values: Vec<String>) -> Vec<String> {
+    let mut deduped = Vec::new();
+    for value in values {
+        if !deduped.iter().any(|existing| existing == &value) {
+            deduped.push(value);
+        }
+    }
+    deduped
 }
 
 fn estimate_batch_prompt_budget(section_ids: &[String], parsed_content: &ParsedPaperContent) -> i32 {
@@ -2233,8 +2566,12 @@ fn validate_enum(value: &str, allowed: &[&str], field: &str) -> Result<(), AppEr
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_agent_output, AppError};
+    use super::{
+        build_context_plan, handoff_chain_sufficient, normalize_agent_output, resolve_handoff_summary_ids,
+        select_handoff_summaries, AppError, ParsedPaperContent, ParsedSection,
+    };
     use crate::{
+        models::parsed_content::ParsedMetadata,
         models::runtime::{GetAgentRunRequest, RunAgentRequest},
         services::parse_service::ParseService,
         repositories::{database::Database, model_repository::ModelRepository, paper_repository::PaperRepository, runtime_repository::RuntimeRepository},
@@ -2416,6 +2753,266 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("needs_deep_read")
         );
+    }
+
+    #[test]
+    fn resolve_handoff_summary_ids_prefers_stage_chain_for_summary() {
+        let request = RunAgentRequest {
+            paper_id: "paper-1".into(),
+            agent_type: "summary".into(),
+            user_question: None,
+            force: None,
+            source_run_ids: None,
+            source_handoff_summary_ids: None,
+            runtime_mode: None,
+            section_strategy: None,
+            max_sections_per_batch: None,
+            max_batches: None,
+            pinned_section_ids: None,
+        };
+
+        let handoff_summaries = vec![
+            json!({ "id": "hs_deep", "stage": "deep_read" }),
+            json!({ "id": "hs_careful", "stage": "careful_read" }),
+            json!({ "id": "hs_quick", "stage": "quick_read" }),
+        ];
+
+        assert_eq!(
+            resolve_handoff_summary_ids(&request, &handoff_summaries),
+            vec!["hs_quick".to_string(), "hs_careful".to_string(), "hs_deep".to_string()]
+        );
+    }
+
+    #[test]
+    fn summary_context_plan_uses_handoff_only_when_chain_complete() {
+        let request = RunAgentRequest {
+            paper_id: "paper-1".into(),
+            agent_type: "summary".into(),
+            user_question: None,
+            force: None,
+            source_run_ids: None,
+            source_handoff_summary_ids: None,
+            runtime_mode: None,
+            section_strategy: None,
+            max_sections_per_batch: None,
+            max_batches: None,
+            pinned_section_ids: None,
+        };
+        let parsed_content = ParsedPaperContent {
+            paper_id: "paper-1".into(),
+            version: 1,
+            full_text: String::new(),
+            sections: vec![
+                ParsedSection {
+                    id: "abstract".into(),
+                    title: "Abstract".into(),
+                    level: 1,
+                    order: 1,
+                    start_page: Some(1),
+                    end_page: Some(1),
+                    locator: "Abstract".into(),
+                    text: "abstract text".into(),
+                },
+                ParsedSection {
+                    id: "conclusion".into(),
+                    title: "Conclusion".into(),
+                    level: 1,
+                    order: 2,
+                    start_page: Some(8),
+                    end_page: Some(8),
+                    locator: "Conclusion".into(),
+                    text: "conclusion text".into(),
+                },
+            ],
+            references: Vec::new(),
+            metadata: ParsedMetadata {
+                page_count: Some(8),
+                parser: "test".into(),
+                parsed_at: "2026-04-04T00:00:00Z".into(),
+            },
+        };
+        let handoff_summaries = vec![
+            json!({ "id": "hs_deep", "stage": "deep_read", "carryForwardQuestions": [], "carryForwardEvidence": [] }),
+            json!({ "id": "hs_careful", "stage": "careful_read", "carryForwardQuestions": [], "carryForwardEvidence": [] }),
+            json!({ "id": "hs_quick", "stage": "quick_read", "carryForwardQuestions": [], "carryForwardEvidence": [] }),
+        ];
+
+        let selected = select_handoff_summaries(&handoff_summaries, &resolve_handoff_summary_ids(&request, &handoff_summaries));
+        assert!(handoff_chain_sufficient("summary", &selected));
+
+        let context_plan = build_context_plan(&request, &parsed_content, &handoff_summaries);
+        assert!(context_plan.selected_section_ids.is_empty());
+        assert_eq!(context_plan.used_handoff_summary_ids.len(), 3);
+        assert_eq!(context_plan.batch_count, 0);
+    }
+
+    #[test]
+    fn deep_read_context_plan_targets_sections_from_handoff_questions_and_evidence() {
+        let request = RunAgentRequest {
+            paper_id: "paper-1".into(),
+            agent_type: "deep_read".into(),
+            user_question: None,
+            force: None,
+            source_run_ids: None,
+            source_handoff_summary_ids: None,
+            runtime_mode: None,
+            section_strategy: None,
+            max_sections_per_batch: Some(3),
+            max_batches: Some(2),
+            pinned_section_ids: None,
+        };
+        let parsed_content = ParsedPaperContent {
+            paper_id: "paper-1".into(),
+            version: 1,
+            full_text: String::new(),
+            sections: vec![
+                ParsedSection {
+                    id: "sec-1".into(),
+                    title: "Method".into(),
+                    level: 1,
+                    order: 1,
+                    start_page: Some(2),
+                    end_page: Some(3),
+                    locator: "Section 3".into(),
+                    text: "method details".into(),
+                },
+                ParsedSection {
+                    id: "sec-2".into(),
+                    title: "Ablation Study".into(),
+                    level: 1,
+                    order: 2,
+                    start_page: Some(6),
+                    end_page: Some(7),
+                    locator: "Section 5".into(),
+                    text: "ablation details".into(),
+                },
+                ParsedSection {
+                    id: "sec-3".into(),
+                    title: "Discussion and Limitations".into(),
+                    level: 1,
+                    order: 3,
+                    start_page: Some(8),
+                    end_page: Some(8),
+                    locator: "Section 6".into(),
+                    text: "limitations details".into(),
+                },
+            ],
+            references: Vec::new(),
+            metadata: ParsedMetadata {
+                page_count: Some(8),
+                parser: "test".into(),
+                parsed_at: "2026-04-04T00:00:00Z".into(),
+            },
+        };
+        let handoff_summaries = vec![
+            json!({
+                "id": "hs_careful",
+                "stage": "careful_read",
+                "carryForwardQuestions": ["Need to verify the limitation discussion and ablation evidence."],
+                "carryForwardEvidence": [
+                    {"section": "Ablation Study", "locator": "Section 5", "quote": "q", "page": 6}
+                ]
+            }),
+            json!({
+                "id": "hs_quick",
+                "stage": "quick_read",
+                "carryForwardQuestions": ["Check whether the method assumptions are realistic."],
+                "carryForwardEvidence": []
+            }),
+        ];
+
+        let context_plan = build_context_plan(&request, &parsed_content, &handoff_summaries);
+        assert!(context_plan.selected_section_ids.iter().any(|id| id == "sec-1"));
+        assert!(context_plan.selected_section_ids.iter().any(|id| id == "sec-2"));
+        assert!(context_plan.selected_section_ids.iter().any(|id| id == "sec-3"));
+    }
+
+    #[test]
+    fn careful_read_context_plan_uses_quick_read_handoff_to_target_sections() {
+        let request = RunAgentRequest {
+            paper_id: "paper-1".into(),
+            agent_type: "careful_read".into(),
+            user_question: None,
+            force: None,
+            source_run_ids: None,
+            source_handoff_summary_ids: None,
+            runtime_mode: None,
+            section_strategy: None,
+            max_sections_per_batch: Some(3),
+            max_batches: Some(2),
+            pinned_section_ids: None,
+        };
+        let parsed_content = ParsedPaperContent {
+            paper_id: "paper-1".into(),
+            version: 1,
+            full_text: String::new(),
+            sections: vec![
+                ParsedSection {
+                    id: "sec-intro".into(),
+                    title: "Introduction".into(),
+                    level: 1,
+                    order: 1,
+                    start_page: Some(1),
+                    end_page: Some(2),
+                    locator: "Section 1".into(),
+                    text: "intro details".into(),
+                },
+                ParsedSection {
+                    id: "sec-method".into(),
+                    title: "Method".into(),
+                    level: 1,
+                    order: 2,
+                    start_page: Some(3),
+                    end_page: Some(5),
+                    locator: "Section 3".into(),
+                    text: "method details".into(),
+                },
+                ParsedSection {
+                    id: "sec-results".into(),
+                    title: "Experimental Results".into(),
+                    level: 1,
+                    order: 3,
+                    start_page: Some(6),
+                    end_page: Some(7),
+                    locator: "Section 4".into(),
+                    text: "result details".into(),
+                },
+                ParsedSection {
+                    id: "sec-limits".into(),
+                    title: "Limitations".into(),
+                    level: 1,
+                    order: 4,
+                    start_page: Some(8),
+                    end_page: Some(8),
+                    locator: "Section 5".into(),
+                    text: "limitation details".into(),
+                },
+            ],
+            references: Vec::new(),
+            metadata: ParsedMetadata {
+                page_count: Some(8),
+                parser: "test".into(),
+                parsed_at: "2026-04-04T00:00:00Z".into(),
+            },
+        };
+        let handoff_summaries = vec![
+            json!({
+                "id": "hs_quick",
+                "stage": "quick_read",
+                "keyPoints": ["The main method looks promising but the evaluation setup still needs confirmation."],
+                "carryForwardQuestions": ["Does the introduction clearly define the gap and do the limitations narrow the claim scope?"],
+                "carryForwardEvidence": [
+                    {"section": "Experimental Results", "locator": "Section 4", "quote": "q", "page": 6}
+                ]
+            }),
+        ];
+
+        let context_plan = build_context_plan(&request, &parsed_content, &handoff_summaries);
+        assert_eq!(context_plan.used_handoff_summary_ids, vec!["hs_quick".to_string()]);
+        assert!(context_plan.selected_section_ids.iter().any(|id| id == "sec-intro"));
+        assert!(context_plan.selected_section_ids.iter().any(|id| id == "sec-method"));
+        assert!(context_plan.selected_section_ids.iter().any(|id| id == "sec-results"));
+        assert!(context_plan.selected_section_ids.iter().any(|id| id == "sec-limits"));
     }
 
     #[tokio::test]

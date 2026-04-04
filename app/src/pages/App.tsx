@@ -733,13 +733,13 @@ export function App() {
 
                 <section className="readerPanel readerPanelScrollable">
                   <span className="eyebrow">Workflow</span>
-                  <strong>Parse: {readerSnapshot.parseStatus}</strong>
+                  <strong>Parse: {formatParseStatus(readerSnapshot.parseStatus)}</strong>
                   <span>Progress: {readerSnapshot.parseProgress}%</span>
-                  <span>Current step: {readerSnapshot.workflowCurrentStep}</span>
-                  <span>Next action: {readerSnapshot.nextActionRequired ?? 'none'}</span>
-                  <span>Library status: {readerSnapshot.libraryStatus ?? 'not saved'}</span>
-                  <span>Starred: {readerSnapshot.starred ? 'yes' : 'no'}</span>
-                  <span>Allowed actions: {readerSnapshot.allowedActions.join(', ') || 'none'}</span>
+                  <span>Current step: {formatWorkflowStep(readerSnapshot.workflowCurrentStep)}</span>
+                  <span>Next action: {formatActionLabel(readerSnapshot.nextActionRequired) ?? 'None'}</span>
+                  <span>Library status: {formatLibraryStatus(readerSnapshot.libraryStatus)}</span>
+                  <span>Starred: {readerSnapshot.starred ? 'Yes' : 'No'}</span>
+                  <span>Allowed actions: {formatAllowedActions(readerSnapshot.allowedActions)}</span>
                   <div className="workflowTimeline">
                     {workflowSteps.map((step) => (
                       <div key={step.id} className={`timelineStep ${step.state}`}>
@@ -801,6 +801,19 @@ export function App() {
                           <span className="detailLabel">Context plan</span>
                           <span>Mode: {activeRun.contextPlan.runtimeMode}</span>
                           <span>Strategy: {activeRun.contextPlan.sectionStrategy}</span>
+                          <p>{activeRun.contextPlan.selectionReason}</p>
+                          <span>
+                            Handoff chain: {activeRun.contextPlan.handoffChainComplete ? 'complete' : 'incomplete'}
+                          </span>
+                          <span>
+                            Handoff summaries: {activeRun.contextPlan.usedHandoffSummaryIds.join(', ') || 'none'}
+                          </span>
+                          <span>
+                            Gap categories: {activeRun.contextPlan.gapCategories.join(', ') || 'none'}
+                          </span>
+                          {activeRun.contextPlan.backfillReason ? (
+                            <p>{activeRun.contextPlan.backfillReason}</p>
+                          ) : null}
                           <span>Sections: {activeRun.contextPlan.selectedSectionIds.join(', ') || 'none'}</span>
                           <span>Batch progress: {activeRun.contextPlan.currentBatchIndex} / {activeRun.contextPlan.batchCount}</span>
                         </div>
@@ -1035,20 +1048,165 @@ function formatRunErrorMessage(message: string | null) {
 
 function buildWorkflowSteps(currentStep: string | null) {
   const ordered = [
-    { id: 'paper_ready', label: 'Paper ready' },
-    { id: 'quick_read_completed', label: 'Quick read' },
-    { id: 'careful_read_completed', label: 'Careful read' },
-    { id: 'deep_read_completed', label: 'Deep read' },
-    { id: 'summary_completed', label: 'Summary' },
+    { id: 'paper_ready', label: 'Paper ready', runningIds: [] },
+    { id: 'quick_read_completed', label: 'Quick read', runningIds: ['quick_read_running'] },
+    { id: 'careful_read_completed', label: 'Careful read', runningIds: ['careful_read_running'] },
+    { id: 'deep_read_completed', label: 'Deep read', runningIds: ['deep_read_running'] },
+    { id: 'summary_completed', label: 'Summary', runningIds: ['summary_running'] },
   ];
 
-  const currentIndex = ordered.findIndex((item) => item.id === currentStep);
+  if (currentStep === 'workflow_blocked') {
+    return ordered.map((item) => ({
+      ...item,
+      state: item.id === 'paper_ready' ? 'blocked' : 'pending',
+      caption: item.id === 'paper_ready' ? 'Blocked' : 'Waiting',
+    }));
+  }
 
-  return ordered.map((item, index) => ({
-    ...item,
-    state: currentStep === 'workflow_blocked' ? 'blocked' : index < currentIndex ? 'done' : index === currentIndex ? 'active' : 'pending',
-    caption: currentStep === 'workflow_blocked' ? 'Blocked' : index < currentIndex ? 'Completed' : index === currentIndex ? 'Current stage' : 'Waiting',
-  }));
+  const completedIndex = ordered.findIndex((item) => item.id === currentStep);
+  const runningIndex = ordered.findIndex((item) => item.runningIds.includes(currentStep ?? ''));
+  const currentIndex = runningIndex >= 0 ? runningIndex : completedIndex;
+  const isRunning = runningIndex >= 0;
+
+  return ordered.map((item, index) => {
+    if (currentIndex < 0) {
+      return {
+        ...item,
+        state: 'pending',
+        caption: 'Waiting',
+      };
+    }
+
+    if (isRunning) {
+      if (index < currentIndex) {
+        return {
+          ...item,
+          state: 'done',
+          caption: 'Completed',
+        };
+      }
+
+      if (index === currentIndex) {
+        return {
+          ...item,
+          state: 'active',
+          caption: 'Running',
+        };
+      }
+
+      return {
+        ...item,
+        state: 'pending',
+        caption: 'Waiting',
+      };
+    }
+
+    if (index <= currentIndex) {
+      return {
+        ...item,
+        state: index === currentIndex ? 'done' : 'done',
+        caption: 'Completed',
+      };
+    }
+
+    return {
+      ...item,
+      state: 'pending',
+      caption: 'Waiting',
+    };
+  });
+}
+
+function formatParseStatus(status: string | null) {
+  switch (status) {
+    case 'queued':
+      return 'Queued';
+    case 'running':
+      return 'Running';
+    case 'succeeded':
+      return 'Succeeded';
+    case 'failed':
+      return 'Failed';
+    default:
+      return status ?? 'Unknown';
+  }
+}
+
+function formatWorkflowStep(step: string | null) {
+  switch (step) {
+    case 'paper_ready':
+      return 'Paper ready';
+    case 'quick_read_running':
+      return 'Quick read running';
+    case 'quick_read_completed':
+      return 'Quick read completed';
+    case 'careful_read_running':
+      return 'Careful read running';
+    case 'careful_read_completed':
+      return 'Careful read completed';
+    case 'deep_read_running':
+      return 'Deep read running';
+    case 'deep_read_completed':
+      return 'Deep read completed';
+    case 'summary_running':
+      return 'Summary running';
+    case 'summary_completed':
+      return 'Summary completed';
+    case 'workflow_blocked':
+      return 'Blocked';
+    default:
+      return step ?? 'Unknown';
+  }
+}
+
+function formatActionLabel(action: string | null) {
+  switch (action) {
+    case 'refresh_status':
+      return 'Refresh status';
+    case 'cancel_run':
+      return 'Cancel run';
+    case 'run_quick_read':
+      return 'Run quick read';
+    case 'run_careful_read':
+      return 'Run careful read';
+    case 'run_deep_read':
+      return 'Run deep read';
+    case 'run_summary':
+      return 'Run summary';
+    case 'save_to_library':
+      return 'Save to library';
+    case 're_run_summary':
+      return 'Re-run summary';
+    case 'reopen_reader':
+      return 'Reopen reader';
+    default:
+      return action;
+  }
+}
+
+function formatAllowedActions(actions: string[]) {
+  if (actions.length === 0) {
+    return 'None';
+  }
+
+  return actions.map((action) => formatActionLabel(action) ?? action).join(', ');
+}
+
+function formatLibraryStatus(status: string | null) {
+  switch (status) {
+    case 'queued':
+      return 'Queued';
+    case 'reading':
+      return 'Reading';
+    case 'completed':
+      return 'Completed';
+    case 'archived':
+      return 'Archived';
+    case null:
+      return 'Not saved';
+    default:
+      return status;
+  }
 }
 
 function renderRunSnapshot(outputSnapshot: string | null) {

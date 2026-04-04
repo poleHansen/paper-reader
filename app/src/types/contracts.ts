@@ -199,6 +199,9 @@ export type ContextPlan = {
   runtimeMode: string;
   sectionStrategy: string;
   selectionReason: string;
+  handoffChainComplete: boolean;
+  backfillReason: string | null;
+  gapCategories: string[];
   selectedSectionIds: string[];
   usedHandoffSummaryIds: string[];
   batchCount: number;
