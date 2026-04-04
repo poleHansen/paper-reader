@@ -6,6 +6,8 @@ import {
   libraryItemMutationResponseSchema,
   libraryListResponseSchema,
   modelConnectionResponseSchema,
+  modelConfigDetailResponseSchema,
+  modelConfigListResponseSchema,
   modelConfigResponseSchema,
   paperParseStatusResponseSchema,
   paperSearchResponseSchema,
@@ -26,6 +28,9 @@ import type {
   LibraryItemMutationResponse,
   LibraryListRequest,
   LibraryListResponse,
+  DeleteModelConfigRequest,
+  ModelConfigDetailResponse,
+  ModelConfigListResponse,
   ModelConfigRequest,
   ModelConfigResponse,
   PaperParseStatusResponse,
@@ -35,8 +40,10 @@ import type {
   SaveToLibraryRequest,
   SearchPapersRequest,
   SearchPapersResponse,
+  SelectModelConfigRequest,
   TestModelConnectionRequest,
   TestModelConnectionResponse,
+  UpdateModelConfigRequest,
   UpdateLibraryItemRequest,
   UserProfile,
 } from '../types/contracts';
@@ -59,6 +66,35 @@ export async function upsertProfile(payload: UserProfile): Promise<UserProfile> 
 export async function saveModelConfig(payload: ModelConfigRequest): Promise<ModelConfigResponse> {
   const response = await invoke('save_model_config', { request: payload });
   return modelConfigResponseSchema.parse(response);
+}
+
+export async function updateModelConfig(payload: UpdateModelConfigRequest): Promise<ModelConfigResponse> {
+  const response = await invoke('update_model_config', { request: payload });
+  return modelConfigResponseSchema.parse(response);
+}
+
+export async function listModelConfigs(): Promise<ModelConfigListResponse> {
+  const response = await invoke('list_model_configs');
+  return modelConfigListResponseSchema.parse(response);
+}
+
+export async function getModelConfigDetail(payload: SelectModelConfigRequest): Promise<ModelConfigDetailResponse> {
+  const response = await invoke('get_model_config_detail', { request: payload });
+  return modelConfigDetailResponseSchema.parse(response);
+}
+
+export async function getRecentModelConfig(): Promise<ModelConfigResponse> {
+  const response = await invoke('get_recent_model_config');
+  return modelConfigResponseSchema.parse(response);
+}
+
+export async function selectModelConfig(payload: SelectModelConfigRequest): Promise<ModelConfigResponse> {
+  const response = await invoke('select_model_config', { request: payload });
+  return modelConfigResponseSchema.parse(response);
+}
+
+export async function deleteModelConfig(payload: DeleteModelConfigRequest): Promise<void> {
+  await invoke('delete_model_config', { request: payload });
 }
 
 export async function testModelConnection(

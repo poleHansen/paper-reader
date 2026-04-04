@@ -3,6 +3,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelConfigRequest {
+    pub display_name: String,
+    pub provider: String,
+    pub base_url: String,
+    pub model_name: String,
+    pub api_key: String,
+    pub api_type: Option<String>,
+    pub agent_type: Option<String>,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateModelConfigRequest {
+    pub id: String,
+    pub display_name: String,
     pub provider: String,
     pub base_url: String,
     pub model_name: String,
@@ -16,14 +31,40 @@ pub struct ModelConfigRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ModelConfigResponse {
     pub id: String,
+    pub display_name: String,
     pub provider: String,
     pub base_url: String,
     pub model_name: String,
     pub api_type: Option<String>,
     pub agent_type: Option<String>,
     pub is_default: bool,
+    pub is_recent: bool,
     pub has_credential: bool,
     pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelConfigDetailResponse {
+    pub id: String,
+    pub display_name: String,
+    pub provider: String,
+    pub base_url: String,
+    pub model_name: String,
+    pub api_key: String,
+    pub api_type: Option<String>,
+    pub agent_type: Option<String>,
+    pub is_default: bool,
+    pub is_recent: bool,
+    pub has_credential: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelConfigListResponse {
+    pub items: Vec<ModelConfigResponse>,
+    pub recent_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]

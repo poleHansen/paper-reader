@@ -20,14 +20,14 @@ def build_stream(lines: list[str]) -> bytes:
 def write_sample_pdf(output_path: Path) -> None:
     lines = [
         "Paper Reader Sample",
-        "Abstract",
+        "1 Overview and Motivation",
         "This is a local PDF fixture for parse pipeline validation.",
-        "Introduction",
-        "The parser should extract text and segment major sections.",
-        "Method",
-        "We generate a tiny PDF with embedded text operators.",
-        "Conclusion",
-        "Successful parsing should produce a JSON artifact and succeeded status.",
+        "2 System Design",
+        "The parser should extract text and segment major sections without relying on canonical names.",
+        "III Evaluation Notes",
+        "We generate a tiny PDF with embedded text operators and expect the parser to recover section boundaries.",
+        "FUTURE DIRECTIONS",
+        "Successful parsing should produce a JSON artifact and multiple structured sections.",
     ]
     stream = build_stream(lines)
 

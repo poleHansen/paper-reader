@@ -342,6 +342,7 @@ impl PaperRepository {
                             fallback_actions: Vec::new(),
                             latest_handoff_summary_ids: Vec::new(),
                             latest_agent_runs: Vec::new(),
+                            active_run: None,
                             updated_at: row.get(20)?,
                         })
                     },
@@ -357,6 +358,7 @@ impl PaperRepository {
             snapshot.fallback_actions = fallback_actions;
             snapshot.latest_handoff_summary_ids = latest_handoff_summary_ids;
             snapshot.latest_agent_runs = latest_runs;
+            snapshot.active_run = runtime_repository.get_active_run(paper_id)?;
             Ok(snapshot)
         })
     }

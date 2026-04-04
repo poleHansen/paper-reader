@@ -5,6 +5,37 @@ const agentRunSummarySchema = z.object({
   finishedAt: z.string().nullable(),
   summary: z.string().nullable(),
   handoffSummaryId: z.string().nullable(),
+  contextPlan: z.lazy(() => contextPlanSchema).nullable().optional(),
+});
+
+const contextBatchSchema = z.object({
+  batchIndex: z.number(),
+  sectionIds: z.array(z.string()),
+  sectionTitles: z.array(z.string()),
+  carryInSummaryIds: z.array(z.string()),
+  promptBudgetEstimate: z.number(),
+});
+
+const contextPlanSchema = z.object({
+  runtimeMode: z.string(),
+  sectionStrategy: z.string(),
+  selectionReason: z.string(),
+  selectedSectionIds: z.array(z.string()),
+  usedHandoffSummaryIds: z.array(z.string()),
+  batchCount: z.number(),
+  currentBatchIndex: z.number(),
+  truncated: z.boolean(),
+  fallbackApplied: z.boolean(),
+  batches: z.array(contextBatchSchema),
+});
+
+const activeAgentRunSchema = z.object({
+  id: z.string(),
+  agentType: z.string(),
+  status: z.string(),
+  currentBatchIndex: z.number(),
+  currentBatchCount: z.number(),
+  contextPlan: contextPlanSchema,
 });
 
 const evidenceItemSchema = z.object({
@@ -65,14 +96,25 @@ export const profileResponseSchema = z.object({
 
 export const modelConfigResponseSchema = z.object({
   id: z.string(),
+  displayName: z.string(),
   provider: z.string(),
   baseUrl: z.string(),
   modelName: z.string(),
   apiType: z.string().nullable(),
   agentType: z.string().nullable(),
   isDefault: z.boolean(),
+  isRecent: z.boolean(),
   hasCredential: z.boolean(),
   updatedAt: z.string(),
+});
+
+export const modelConfigDetailResponseSchema = modelConfigResponseSchema.extend({
+  apiKey: z.string(),
+});
+
+export const modelConfigListResponseSchema = z.object({
+  items: z.array(modelConfigResponseSchema),
+  recentId: z.string().nullable(),
 });
 
 export const modelConnectionResponseSchema = z.object({
@@ -138,6 +180,7 @@ export const readerSnapshotSchema = z.object({
   fallbackActions: z.array(z.string()),
   latestHandoffSummaryIds: z.array(z.string()),
   latestAgentRuns: z.array(agentRunSummarySchema),
+  activeRun: activeAgentRunSchema.nullable().optional(),
   updatedAt: z.string(),
 });
 
@@ -155,6 +198,7 @@ export const agentRunDetailSchema = z.object({
   inputSnapshot: z.string(),
   outputSnapshot: z.string().nullable(),
   handoffSummary: handoffSummarySchema.nullable().optional(),
+  contextPlan: contextPlanSchema.nullable().optional(),
   errorCode: z.string().nullable(),
   errorMessage: z.string().nullable(),
   startedAt: z.string().nullable(),

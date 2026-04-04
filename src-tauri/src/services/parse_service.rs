@@ -1,7 +1,7 @@
 use std::{path::{Path, PathBuf}, process::Stdio, sync::Arc};
 
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::{io::AsyncWriteExt, process::Command};
 
 use crate::{
@@ -21,7 +21,7 @@ impl ParseService {
         Self { database }
     }
 
-    pub async fn parse_paper(&self, app: &AppHandle, paper_id: &str) -> Result<(), AppError> {
+    pub async fn parse_paper<R: Runtime>(&self, app: &AppHandle<R>, paper_id: &str) -> Result<(), AppError> {
         let pdf_path = self.load_pdf_path(paper_id)?;
         let parsed_dir = app
             .path()
@@ -84,7 +84,7 @@ impl ParseService {
         })
     }
 
-    async fn invoke_sidecar(&self, app: &AppHandle, paper_id: &str, pdf_path: &str) -> Result<ParsedPaperContent, AppError> {
+    async fn invoke_sidecar<R: Runtime>(&self, app: &AppHandle<R>, paper_id: &str, pdf_path: &str) -> Result<ParsedPaperContent, AppError> {
         let sidecar_root = resolve_sidecar_root(app)?;
         let main_script = sidecar_root.join("main.py");
         if !main_script.exists() {
@@ -184,9 +184,9 @@ impl ParseService {
         })
     }
 
-    fn update_parse_status(
+    fn update_parse_status<R: Runtime>(
         &self,
-        app: &AppHandle,
+        app: &AppHandle<R>,
         paper_id: &str,
         status: &str,
         stage: &str,
@@ -227,7 +227,7 @@ impl ParseService {
     }
 }
 
-fn resolve_sidecar_root(app: &AppHandle) -> Result<PathBuf, AppError> {
+fn resolve_sidecar_root<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, AppError> {
     let resolver = app.path();
     if let Ok(resource_dir) = resolver.resource_dir() {
         let candidate = resource_dir.join("python-sidecar");

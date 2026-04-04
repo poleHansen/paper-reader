@@ -1,4 +1,4 @@
-use crate::models::runtime::AgentRunSummary;
+use crate::models::runtime::{AgentRunSummary, ContextPlan};
 
 use serde::{Deserialize, Serialize};
 
@@ -137,5 +137,17 @@ pub struct ReaderSnapshotResponse {
     pub fallback_actions: Vec<String>,
     pub latest_handoff_summary_ids: Vec<String>,
     pub latest_agent_runs: Vec<AgentRunSummary>,
+    pub active_run: Option<ActiveAgentRunResponse>,
     pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveAgentRunResponse {
+    pub id: String,
+    pub agent_type: String,
+    pub status: String,
+    pub current_batch_index: i32,
+    pub current_batch_count: i32,
+    pub context_plan: ContextPlan,
 }

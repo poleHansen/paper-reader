@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS library_items (
 
 CREATE TABLE IF NOT EXISTS model_configs (
   id TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL,
   provider TEXT NOT NULL,
   base_url TEXT NOT NULL,
   model_name TEXT NOT NULL,
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS model_configs (
   api_key_fallback TEXT,
   agent_type TEXT,
   is_default INTEGER NOT NULL DEFAULT 0,
+  is_recent INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

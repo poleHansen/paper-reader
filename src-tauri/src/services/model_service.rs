@@ -3,8 +3,9 @@ use std::{sync::Arc, time::Instant};
 use crate::{
     errors::AppError,
     models::model::{
-        ModelConfigRequest, ModelConfigResponse, StoredModelConfig, TestModelConnectionRequest,
-        TestModelConnectionResponse,
+        ModelConfigDetailResponse, ModelConfigListResponse, ModelConfigRequest, ModelConfigResponse,
+        StoredModelConfig, TestModelConnectionRequest, TestModelConnectionResponse,
+        UpdateModelConfigRequest,
     },
     repositories::{database::Database, model_repository::ModelRepository, runtime_repository::probe_model_endpoint},
 };
@@ -21,13 +22,61 @@ impl ModelService {
     }
 
     pub async fn save_model_config(&self, request: ModelConfigRequest) -> Result<ModelConfigResponse, AppError> {
-        if request.provider.trim().is_empty() || request.base_url.trim().is_empty() || request.model_name.trim().is_empty() {
-            return Err(AppError::Validation("provider, baseUrl, and modelName are required".into()));
+        if request.display_name.trim().is_empty()
+            || request.provider.trim().is_empty()
+            || request.base_url.trim().is_empty()
+            || request.model_name.trim().is_empty()
+        {
+            return Err(AppError::Validation("displayName, provider, baseUrl, and modelName are required".into()));
         }
         if request.api_key.trim().is_empty() {
             return Err(AppError::Validation("apiKey is required when saving a model config".into()));
         }
         self.repository.save(&request)
+    }
+
+    pub async fn list_model_configs(&self) -> Result<ModelConfigListResponse, AppError> {
+        self.repository.list()
+    }
+
+    pub async fn get_model_config_detail(&self, id: String) -> Result<ModelConfigDetailResponse, AppError> {
+        if id.trim().is_empty() {
+            return Err(AppError::Validation("model config id is required".into()));
+        }
+
+        self.repository.get_detail(&id)
+    }
+
+    pub async fn update_model_config(&self, request: UpdateModelConfigRequest) -> Result<ModelConfigResponse, AppError> {
+        if request.id.trim().is_empty()
+            || request.display_name.trim().is_empty()
+            || request.provider.trim().is_empty()
+            || request.base_url.trim().is_empty()
+            || request.model_name.trim().is_empty()
+        {
+            return Err(AppError::Validation("id, displayName, provider, baseUrl, and modelName are required".into()));
+        }
+
+        self.repository.update(&request)
+    }
+
+    pub async fn delete_model_config(&self, id: String) -> Result<(), AppError> {
+        if id.trim().is_empty() {
+            return Err(AppError::Validation("model config id is required".into()));
+        }
+
+        self.repository.delete(&id)
+    }
+
+    pub async fn get_recent_model_config(&self) -> Result<ModelConfigResponse, AppError> {
+        self.repository.get_recent()
+    }
+
+    pub async fn select_model_config(&self, id: String) -> Result<ModelConfigResponse, AppError> {
+        if id.trim().is_empty() {
+            return Err(AppError::Validation("model config id is required".into()));
+        }
+        self.repository.mark_recent(&id)
     }
 
     pub async fn test_model_connection(

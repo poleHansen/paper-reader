@@ -3,17 +3,18 @@ use std::{fs, sync::Arc};
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::process::Command;
+use tokio::{io::AsyncWriteExt, process::Command};
 use uuid::Uuid;
 
 use crate::{
     errors::AppError,
     models::{
         model::StoredModelConfig,
+        paper::ActiveAgentRunResponse,
         parsed_content::{ParsedPaperContent, ParsedSection},
         runtime::{
-            AgentRunDetailResponse, AgentRunSummary, EvidenceItem, GetAgentRunRequest, HandoffSummaryResponse,
-            RunAgentRequest, RunAgentResponse,
+            AgentRunDetailResponse, AgentRunSummary, ContextBatch, ContextPlan, EvidenceItem,
+            GetAgentRunRequest, HandoffSummaryResponse, RunAgentRequest, RunAgentResponse,
         },
     },
     repositories::database::Database,
@@ -84,7 +85,7 @@ impl RuntimeRepository {
         self.mark_run_started(&run_id, &request, model_config, &run_context.input_snapshot, &now)?;
 
         let execution_result = self
-            .execute_agent(model_config, &request.agent_type, &run_context.prompt)
+            .execute_agent(&run_id, model_config, &request.agent_type, &run_context)
             .await;
 
         match execution_result {
@@ -111,17 +112,20 @@ impl RuntimeRepository {
                      FROM agent_runs WHERE id = ?1",
                     rusqlite::params![request.run_id],
                     |row| {
+                        let input_snapshot: String = row.get(4)?;
+                        let context_plan = extract_context_plan_from_snapshot(&input_snapshot);
                         Ok((
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
+                            input_snapshot,
                             row.get::<_, Option<String>>(5)?,
                             row.get::<_, Option<String>>(6)?,
                             row.get::<_, Option<String>>(7)?,
                             row.get::<_, Option<String>>(8)?,
                             row.get::<_, Option<String>>(9)?,
+                            context_plan,
                         ))
                     },
                 )
@@ -159,6 +163,7 @@ impl RuntimeRepository {
                 input_snapshot: run.4,
                 output_snapshot: run.5,
                 handoff_summary: handoff,
+                context_plan: run.10,
                 error_code: run.6,
                 error_message: run.7,
                 started_at: run.8,
@@ -170,7 +175,7 @@ impl RuntimeRepository {
     pub fn list_recent_runs(&self, paper_id: &str) -> Result<Vec<AgentRunSummary>, AppError> {
         self.database.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT r.id, r.agent_type, r.status, r.finished_at, r.output_snapshot_json, h.id
+                "SELECT r.id, r.agent_type, r.status, r.finished_at, r.output_snapshot_json, h.id, r.input_snapshot_json
                  FROM agent_runs r
                  LEFT JOIN agent_handoff_summaries h ON h.run_id = r.id
                  WHERE r.paper_id = ?1
@@ -180,6 +185,7 @@ impl RuntimeRepository {
 
             let rows = statement
                 .query_map(rusqlite::params![paper_id], |row| {
+                    let input_snapshot: String = row.get(6)?;
                     let output_snapshot: Option<String> = row.get(4)?;
                     let summary = output_snapshot
                         .as_deref()
@@ -192,11 +198,42 @@ impl RuntimeRepository {
                         finished_at: row.get(3)?,
                         summary,
                         handoff_summary_id: row.get(5)?,
+                        context_plan: extract_context_plan_from_snapshot(&input_snapshot),
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
 
             Ok(rows)
+        })
+    }
+
+    pub fn get_active_run(&self, paper_id: &str) -> Result<Option<ActiveAgentRunResponse>, AppError> {
+        self.database.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT id, agent_type, status, input_snapshot_json
+                     FROM agent_runs
+                     WHERE paper_id = ?1 AND status = 'running'
+                     ORDER BY created_at DESC
+                     LIMIT 1",
+                    rusqlite::params![paper_id],
+                    |row| {
+                        let input_snapshot: String = row.get(3)?;
+                        let context_plan = extract_context_plan_from_snapshot(&input_snapshot).ok_or_else(|| {
+                            rusqlite::Error::InvalidColumnType(3, "input_snapshot_json".into(), rusqlite::types::Type::Text)
+                        })?;
+                        Ok(ActiveAgentRunResponse {
+                            id: row.get(0)?,
+                            agent_type: row.get(1)?,
+                            status: row.get(2)?,
+                            current_batch_index: context_plan.current_batch_index,
+                            current_batch_count: context_plan.batch_count,
+                            context_plan,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(AppError::from)
         })
     }
 
@@ -316,6 +353,9 @@ impl RuntimeRepository {
 
             let previous_runs = load_previous_runs(connection, &request.paper_id)?;
             let handoff_summaries = load_handoff_summaries(connection, &request.paper_id)?;
+            let context_plan = build_context_plan(request, &parsed_content, &handoff_summaries);
+            let planned_sections = planned_sections_for_snapshot(&parsed_content, &context_plan);
+            let prompt_handoff_summaries = select_handoff_summaries(&handoff_summaries, &context_plan.used_handoff_summary_ids);
 
             let input_snapshot = json!({
                 "paper": {
@@ -339,17 +379,23 @@ impl RuntimeRepository {
                 })),
                 "paperContent": {
                     "abstract": paper.abstract_text,
-                    "sections": parsed_content.sections,
-                    "fullText": parsed_content.full_text,
+                    "sections": planned_sections,
+                    "fullText": Value::Null,
                     "fullTextAvailable": paper.full_text_available,
                     "pageCount": paper.page_count,
                     "sectionCount": paper.section_count,
                 },
                 "previousRuns": previous_runs,
-                "handoffSummaries": handoff_summaries,
+                "handoffSummaries": prompt_handoff_summaries,
                 "latestWorkflowHandoffIds": workflow,
                 "userQuestion": user_question,
                 "agentType": request.agent_type,
+                "runtimeMode": context_plan.runtime_mode,
+                "sectionStrategy": context_plan.section_strategy,
+                "selectedSectionIds": context_plan.selected_section_ids,
+                "selectedHandoffSummaryIds": context_plan.used_handoff_summary_ids,
+                "batchCount": context_plan.batch_count,
+                "contextPlan": context_plan,
                 "runtimeModel": {
                     "provider": model_config.provider,
                     "modelName": model_config.model_name,
@@ -363,15 +409,17 @@ impl RuntimeRepository {
                 &request.agent_type,
                 &paper,
                 &parsed_content,
+                &context_plan,
                 profile.as_ref(),
                 &previous_runs,
-                &handoff_summaries,
+                &prompt_handoff_summaries,
                 user_question,
             );
 
             Ok(RunContext {
                 input_snapshot: input_snapshot.to_string(),
                 current_handoff_ids: workflow,
+                context_plan,
                 prompt,
             })
         })
@@ -548,28 +596,46 @@ impl RuntimeRepository {
 
     async fn execute_agent(
         &self,
+        run_id: &str,
         model_config: &StoredModelConfig,
         agent_type: &str,
-        prompt: &str,
+        run_context: &RunContext,
     ) -> Result<AgentExecutionOutput, AppError> {
         if model_config.provider != "openai_compatible" {
             return Err(AppError::Validation("runtime only supports openai_compatible models".into()));
         }
 
-        let completion = request_model_completion(model_config, agent_type, prompt).await?;
-        let content = completion_content(&completion)?;
+        let mut batch_outputs = Vec::new();
+        let mut aggregate_completion: Option<CompletionEnvelope> = None;
 
-        let (output, final_completion) = match parse_agent_output(agent_type, &content) {
-            Ok(output) => (output, completion),
-            Err(AppError::SchemaInvalid(error_message)) => {
-                let repair_prompt = build_schema_repair_prompt(agent_type, prompt, &content, &error_message);
-                let repair_completion = request_model_completion(model_config, agent_type, &repair_prompt).await?;
-                let repair_content = completion_content(&repair_completion)?;
-                let repaired_output = parse_agent_output(agent_type, &repair_content)?;
-                (repaired_output, merge_usage(completion, repair_completion))
-            }
-            Err(error) => return Err(error),
-        };
+        for batch in &run_context.context_plan.batches {
+            self.update_running_batch_progress(run_id, batch.batch_index)?;
+            let batch_prompt = build_batch_prompt(&run_context.prompt, batch);
+            let completion = request_model_completion(model_config, agent_type, &batch_prompt).await?;
+            let content = completion_content(&completion)?;
+
+            let (output, final_completion) = match parse_agent_output(agent_type, &content) {
+                Ok(output) => (output, completion),
+                Err(AppError::SchemaInvalid(error_message)) => {
+                    let repair_prompt = build_schema_repair_prompt(agent_type, &batch_prompt, &content, &error_message);
+                    let repair_completion = request_model_completion(model_config, agent_type, &repair_prompt).await?;
+                    let repair_content = completion_content(&repair_completion)?;
+                    let repaired_output = parse_agent_output(agent_type, &repair_content)?;
+                    (repaired_output, merge_usage(completion, repair_completion))
+                }
+                Err(error) => return Err(error),
+            };
+
+            aggregate_completion = Some(match aggregate_completion.take() {
+                Some(previous) => merge_usage(previous, final_completion),
+                None => final_completion,
+            });
+            batch_outputs.push(output.output_json);
+        }
+
+        let merged_output = merge_batch_output_json(agent_type, &batch_outputs)?;
+        let output = normalize_agent_output(agent_type, merged_output)?;
+        let final_completion = aggregate_completion.ok_or_else(|| AppError::Internal("runtime executed zero batches".into()))?;
 
         Ok(AgentExecutionOutput {
             output_json: output.output_json,
@@ -582,13 +648,35 @@ impl RuntimeRepository {
             cost_estimate: None,
         })
     }
+
+    fn update_running_batch_progress(&self, run_id: &str, current_batch_index: i32) -> Result<(), AppError> {
+        self.database.with_connection(|connection| {
+            let input_snapshot: String = connection.query_row(
+                "SELECT input_snapshot_json FROM agent_runs WHERE id = ?1",
+                rusqlite::params![run_id],
+                |row| row.get(0),
+            )?;
+
+            let updated_snapshot = update_context_plan_current_batch_index(&input_snapshot, current_batch_index)?;
+
+            connection.execute(
+                "UPDATE agent_runs SET input_snapshot_json = ?1 WHERE id = ?2",
+                rusqlite::params![updated_snapshot, run_id],
+            )?;
+
+            Ok(())
+        })
+    }
 }
 
 struct RunContext {
     input_snapshot: String,
     current_handoff_ids: Vec<String>,
+    context_plan: ContextPlan,
     prompt: String,
 }
+
+type CompletionEnvelope = ChatCompletionResponse;
 
 struct PaperPromptContext {
     paper_id: String,
@@ -749,6 +837,7 @@ fn build_prompt(
     agent_type: &str,
     paper: &PaperPromptContext,
     parsed_content: &ParsedPaperContent,
+    context_plan: &ContextPlan,
     profile: Option<&ProfilePromptContext>,
     previous_runs: &[Value],
     handoff_summaries: &[Value],
@@ -777,12 +866,12 @@ fn build_prompt(
     };
     let handoff_requirement = handoff_prompt_requirement(agent_type);
     let schema_requirement = schema_prompt_requirement(agent_type);
-    let prompt_paper_content = prompt_paper_content(agent_type, parsed_content, paper.full_text_available, paper.page_count, paper.section_count);
-    let prompt_previous_runs = truncate_json_value(Value::Array(previous_runs.to_vec()), 6_000);
+    let prompt_paper_content = prompt_paper_content(parsed_content, context_plan, paper.full_text_available, paper.page_count, paper.section_count);
+    let prompt_previous_runs = truncate_json_value(Value::Array(previous_runs.to_vec()), 3_000);
     let prompt_handoff_summaries = truncate_json_value(Value::Array(handoff_summaries.to_vec()), 6_000);
 
     format!(
-        "Agent type: {agent_type}\n\nTask contract:\n- Follow the paper-reader prompt contract and runtime spec.\n- Return strict JSON only.\n- Include summary and evidence[].\n- Evidence items must use fields quote, section, page, locator.\n- Do not invent facts beyond provided metadata/abstract/previous outputs.\n- Output language: {output_language}.\n- If information is insufficient, preserve schema and say so explicitly.\n{schema_requirement}\n{handoff_requirement}\n\nPaper metadata:\n{paper_metadata}\n\nUser profile:\n{profile_summary}\n\nAvailable paper content:\n{paper_content}\n\nPrevious runs:\n{previous_runs}\n\nPrevious handoff summaries:\n{handoff_summaries}\n\nLow confidence warning: {low_confidence}\n\nUser question:\n{user_question}\n\nReturn a JSON object matching the {agent_type} runtime schema from the docs.",
+        "Agent type: {agent_type}\n\nTask contract:\n- Follow the paper-reader prompt contract and runtime spec.\n- Return strict JSON only.\n- Include summary and evidence[].\n- Evidence items must use fields quote, section, page, locator.\n- Do not invent facts beyond provided metadata/abstract/previous outputs.\n- Output language: {output_language}.\n- If information is insufficient, preserve schema and say so explicitly.\n{schema_requirement}\n{handoff_requirement}\n\nSection-aware execution plan:\n{context_plan}\n\nPaper metadata:\n{paper_metadata}\n\nUser profile:\n{profile_summary}\n\nAvailable paper content:\n{paper_content}\n\nPrevious runs:\n{previous_runs}\n\nPrevious handoff summaries:\n{handoff_summaries}\n\nLow confidence warning: {low_confidence}\n\nUser question:\n{user_question}\n\nReturn a JSON object matching the {agent_type} runtime schema from the docs.",
         paper_metadata = json!({
             "paperId": paper.paper_id,
             "title": paper.title,
@@ -791,6 +880,7 @@ fn build_prompt(
             "year": paper.year,
             "fileName": paper.file_name,
         }),
+        context_plan = serde_json::to_string_pretty(context_plan).unwrap_or_else(|_| "{}".into()),
         paper_content = prompt_paper_content,
         previous_runs = prompt_previous_runs,
         handoff_summaries = prompt_handoff_summaries,
@@ -820,55 +910,297 @@ fn handoff_prompt_requirement(agent_type: &str) -> String {
 }
 
 fn prompt_paper_content(
-    agent_type: &str,
     parsed_content: &ParsedPaperContent,
+    context_plan: &ContextPlan,
     full_text_available: bool,
     page_count: Option<i32>,
     section_count: i32,
 ) -> Value {
-    let section_limit = match agent_type {
-        "quick_read" => 4,
-        "careful_read" => 8,
-        "deep_read" | "summary" => 12,
-        _ => 6,
-    };
-    let section_char_limit = match agent_type {
-        "quick_read" => 800,
-        "careful_read" => 1600,
-        "deep_read" | "summary" => 2200,
-        _ => 1200,
-    };
-    let full_text_limit = match agent_type {
-        "quick_read" => 0,
-        "careful_read" => 4000,
-        "deep_read" | "summary" => 12000,
-        _ => 2000,
-    };
-
     let trimmed_sections = parsed_content
         .sections
         .iter()
-        .take(section_limit)
+        .filter(|section| context_plan.selected_section_ids.iter().any(|section_id| section_id == &section.id))
         .map(|section| {
             json!({
+                "id": section.id,
                 "title": section.title,
                 "level": section.level,
                 "pageStart": section.start_page,
                 "pageEnd": section.end_page,
                 "locator": section.locator,
-                "text": truncate_text(&section.text, section_char_limit),
+                "text": truncate_text(&section.text, 2200),
             })
         })
         .collect::<Vec<_>>();
 
     json!({
         "sections": trimmed_sections,
-        "fullText": if full_text_limit == 0 { String::new() } else { truncate_text(&parsed_content.full_text, full_text_limit) },
+        "fullText": Value::Null,
         "fullTextAvailable": full_text_available,
         "pageCount": page_count,
         "sectionCount": section_count,
-        "truncated": true,
+        "truncated": context_plan.truncated,
     })
+}
+
+fn build_context_plan(
+    request: &RunAgentRequest,
+    parsed_content: &ParsedPaperContent,
+    handoff_summaries: &[Value],
+) -> ContextPlan {
+    let runtime_mode = request
+        .runtime_mode
+        .clone()
+        .unwrap_or_else(|| "sectioned".to_string());
+    let requested_strategy = request
+        .section_strategy
+        .clone()
+        .unwrap_or_else(|| "agent_default".to_string());
+    let max_sections_per_batch = request.max_sections_per_batch.unwrap_or(default_max_sections_per_batch(&request.agent_type)).max(1);
+    let max_batches = request.max_batches.unwrap_or(3).max(1);
+    let mut selected_sections = select_section_ids_for_agent(&request.agent_type, parsed_content);
+
+    if let Some(pinned_section_ids) = request.pinned_section_ids.as_ref() {
+        for section_id in pinned_section_ids {
+            if parsed_content.sections.iter().any(|section| &section.id == section_id)
+                && !selected_sections.iter().any(|existing| existing == section_id)
+            {
+                selected_sections.push(section_id.clone());
+            }
+        }
+    }
+
+    if selected_sections.is_empty() {
+        selected_sections = parsed_content
+            .sections
+            .iter()
+            .take(max_sections_per_batch as usize)
+            .map(|section| section.id.clone())
+            .collect();
+    }
+
+    let total_selected = selected_sections.len();
+    let truncated_selected = total_selected > (max_sections_per_batch * max_batches) as usize;
+    let selected_sections = selected_sections
+        .into_iter()
+        .take((max_sections_per_batch * max_batches) as usize)
+        .collect::<Vec<_>>();
+    let used_handoff_summary_ids = resolve_handoff_summary_ids(request, handoff_summaries);
+
+    let batches = selected_sections
+        .chunks(max_sections_per_batch as usize)
+        .enumerate()
+        .map(|(index, batch_sections)| ContextBatch {
+            batch_index: index as i32 + 1,
+            section_ids: batch_sections.to_vec(),
+            section_titles: batch_sections
+                .iter()
+                .filter_map(|section_id| parsed_content.sections.iter().find(|section| &section.id == section_id))
+                .map(|section| section.title.clone())
+                .collect(),
+            carry_in_summary_ids: used_handoff_summary_ids.clone(),
+            prompt_budget_estimate: estimate_batch_prompt_budget(batch_sections, parsed_content),
+        })
+        .collect::<Vec<_>>();
+
+    ContextPlan {
+        runtime_mode,
+        section_strategy: requested_strategy,
+        selection_reason: selection_reason_for_agent(&request.agent_type),
+        selected_section_ids: selected_sections,
+        used_handoff_summary_ids,
+        batch_count: batches.len() as i32,
+        current_batch_index: 0,
+        truncated: truncated_selected,
+        fallback_applied: false,
+        batches,
+    }
+}
+
+fn default_max_sections_per_batch(agent_type: &str) -> i32 {
+    match agent_type {
+        "quick_read" => 4,
+        "careful_read" => 3,
+        "deep_read" => 2,
+        "summary" => 2,
+        _ => 3,
+    }
+}
+
+fn selection_reason_for_agent(agent_type: &str) -> String {
+    match agent_type {
+        "quick_read" => "Prioritize abstract, introduction, method, experiment/results, and conclusion so fast relevance checks still include core evidence and performance signals.".to_string(),
+        "careful_read" => "Prioritize method, experiment, and limitation sections for structured evaluation.".to_string(),
+        "deep_read" => "Prioritize implementation details, experiments, and appendix-style evidence for deep inspection.".to_string(),
+        "summary" => "Prefer handoff summaries first and only keep a small set of anchor sections for evidence backfill.".to_string(),
+        _ => "Use the highest-signal sections for the selected agent type.".to_string(),
+    }
+}
+
+fn select_section_ids_for_agent(agent_type: &str, parsed_content: &ParsedPaperContent) -> Vec<String> {
+    let keywords = keywords_for_agent(agent_type);
+    let mut prioritized = parsed_content
+        .sections
+        .iter()
+        .filter(|section| section_matches_keywords(section, &keywords))
+        .map(|section| section.id.clone())
+        .collect::<Vec<_>>();
+
+    if prioritized.is_empty() {
+        prioritized = parsed_content.sections.iter().take(6).map(|section| section.id.clone()).collect();
+    }
+
+    prioritized
+}
+
+fn keywords_for_agent(agent_type: &str) -> Vec<&'static str> {
+    match agent_type {
+        "quick_read" => vec![
+            "abstract",
+            "introduction",
+            "intro",
+            "method",
+            "approach",
+            "framework",
+            "experiment",
+            "evaluation",
+            "ablation",
+            "result",
+            "conclusion",
+        ],
+        "careful_read" => vec!["method", "approach", "experiment", "evaluation", "limitation"],
+        "deep_read" => vec!["method", "implementation", "experiment", "appendix", "ablation"],
+        "summary" => vec!["abstract", "conclusion", "discussion", "result"],
+        _ => vec!["abstract", "introduction", "conclusion"],
+    }
+}
+
+fn section_matches_keywords(section: &ParsedSection, keywords: &[&str]) -> bool {
+    let title = section.title.to_lowercase();
+    keywords.iter().any(|keyword| title.contains(keyword))
+}
+
+fn resolve_handoff_summary_ids(request: &RunAgentRequest, handoff_summaries: &[Value]) -> Vec<String> {
+    if let Some(ids) = request.source_handoff_summary_ids.as_ref() {
+        return ids.clone();
+    }
+
+    handoff_summaries
+        .iter()
+        .filter_map(|summary| summary.get("id").and_then(Value::as_str).map(str::to_string))
+        .take(3)
+        .collect()
+}
+
+fn estimate_batch_prompt_budget(section_ids: &[String], parsed_content: &ParsedPaperContent) -> i32 {
+    section_ids
+        .iter()
+        .filter_map(|section_id| parsed_content.sections.iter().find(|section| &section.id == section_id))
+        .map(|section| (section.text.chars().count() / 4) as i32)
+        .sum()
+}
+
+fn planned_sections_for_snapshot(parsed_content: &ParsedPaperContent, context_plan: &ContextPlan) -> Vec<ParsedSection> {
+    parsed_content
+        .sections
+        .iter()
+        .filter(|section| context_plan.selected_section_ids.iter().any(|section_id| section_id == &section.id))
+        .cloned()
+        .collect()
+}
+
+fn select_handoff_summaries(handoff_summaries: &[Value], selected_ids: &[String]) -> Vec<Value> {
+    handoff_summaries
+        .iter()
+        .filter(|summary| {
+            summary
+                .get("id")
+                .and_then(Value::as_str)
+                .map(|summary_id| selected_ids.iter().any(|selected_id| selected_id == summary_id))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
+fn extract_context_plan_from_snapshot(input_snapshot: &str) -> Option<ContextPlan> {
+    serde_json::from_str::<Value>(input_snapshot)
+        .ok()
+        .and_then(|value| value.get("contextPlan").cloned())
+        .and_then(|value| serde_json::from_value::<ContextPlan>(value).ok())
+}
+
+fn update_context_plan_current_batch_index(snapshot: &str, current_batch_index: i32) -> Result<String, AppError> {
+    let mut snapshot_value = serde_json::from_str::<Value>(snapshot)
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+
+    let Some(context_plan) = snapshot_value.get_mut("contextPlan").and_then(Value::as_object_mut) else {
+        return Err(AppError::Internal("context plan missing from input snapshot".into()));
+    };
+
+    context_plan.insert(
+        "currentBatchIndex".into(),
+        Value::Number(serde_json::Number::from(current_batch_index as i64)),
+    );
+
+    serde_json::to_string(&snapshot_value).map_err(|error| AppError::Internal(error.to_string()))
+}
+
+fn build_batch_prompt(base_prompt: &str, batch: &ContextBatch) -> String {
+    format!(
+        "{base_prompt}\n\nCurrent execution batch:\n- batchIndex: {batch_index}\n- sectionIds: {section_ids}\n- sectionTitles: {section_titles}\n- carryInSummaryIds: {carry_in_summary_ids}\n- promptBudgetEstimate: {prompt_budget_estimate}\n- Focus only on the evidence contained in this batch while keeping previous batch conclusions consistent.\n",
+        batch_index = batch.batch_index,
+        section_ids = serde_json::to_string(&batch.section_ids).unwrap_or_else(|_| "[]".into()),
+        section_titles = serde_json::to_string(&batch.section_titles).unwrap_or_else(|_| "[]".into()),
+        carry_in_summary_ids = serde_json::to_string(&batch.carry_in_summary_ids).unwrap_or_else(|_| "[]".into()),
+        prompt_budget_estimate = batch.prompt_budget_estimate,
+    )
+}
+
+fn merge_batch_output_json(agent_type: &str, batch_outputs: &[Value]) -> Result<Value, AppError> {
+    let Some(mut merged) = batch_outputs.first().cloned() else {
+        return Err(AppError::Internal("no batch outputs generated".into()));
+    };
+
+    for batch_output in batch_outputs.iter().skip(1) {
+        merge_json_values(&mut merged, batch_output);
+    }
+
+    if let Some(object) = merged.as_object_mut() {
+        object.insert("agentType".into(), Value::String(agent_type.to_string()));
+        object.insert("batchCount".into(), Value::Number(serde_json::Number::from(batch_outputs.len() as i64)));
+    }
+
+    Ok(merged)
+}
+
+fn merge_json_values(target: &mut Value, source: &Value) {
+    match (target, source) {
+        (Value::Object(target_map), Value::Object(source_map)) => {
+            for (key, source_value) in source_map {
+                match target_map.get_mut(key) {
+                    Some(target_value) => merge_json_values(target_value, source_value),
+                    None => {
+                        target_map.insert(key.clone(), source_value.clone());
+                    }
+                }
+            }
+        }
+        (Value::Array(target_items), Value::Array(source_items)) => {
+            for item in source_items {
+                if !target_items.iter().any(|existing| existing == item) {
+                    target_items.push(item.clone());
+                }
+            }
+        }
+        (target_value, source_value) => {
+            let should_replace = matches!(target_value, Value::Null)
+                || target_value.as_str().map(|value| value.trim().is_empty()).unwrap_or(false);
+            if should_replace {
+                *target_value = source_value.clone();
+            }
+        }
+    }
 }
 
 fn truncate_text(value: &str, max_chars: usize) -> String {
@@ -894,24 +1226,28 @@ fn normalize_agent_output(agent_type: &str, mut parsed: Value) -> Result<Normali
         .as_object_mut()
         .ok_or_else(|| AppError::SchemaInvalid("model output must be a JSON object".into()))?;
 
-    let summary = object
-        .get("summary")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| AppError::SchemaInvalid("model output missing summary".into()))?
-        .to_string();
+    let summary = derive_agent_summary(agent_type, object)?;
 
-    let evidence = normalize_evidence_list(object.get("evidence"))?;
-    if evidence.is_empty() {
-        return Err(AppError::SchemaInvalid("model output missing evidence".into()));
-    }
+    let evidence = if agent_type == "summary" {
+        Vec::new()
+    } else {
+        let normalized = normalize_evidence_list(object.get("evidence"))?;
+        if normalized.is_empty() {
+            return Err(AppError::SchemaInvalid("model output missing evidence".into()));
+        }
+        normalized
+    };
 
     object.insert("agentType".into(), Value::String(agent_type.to_string()));
     object.insert("summary".into(), Value::String(summary.clone()));
-    object.insert(
-        "evidence".into(),
-        serde_json::to_value(&evidence).map_err(|error| AppError::Internal(error.to_string()))?,
-    );
+    if agent_type != "summary" {
+        object.insert(
+            "evidence".into(),
+            serde_json::to_value(&evidence).map_err(|error| AppError::Internal(error.to_string()))?,
+        );
+    }
+
+    synthesize_agent_specific_fields(agent_type, object, &summary);
 
     let handoff_summary = if agent_type == "summary" {
         None
@@ -946,6 +1282,228 @@ fn normalize_agent_output(agent_type: &str, mut parsed: Value) -> Result<Normali
         output_json: parsed,
         handoff_summary,
     })
+}
+
+fn synthesize_agent_specific_fields(
+    agent_type: &str,
+    object: &mut serde_json::Map<String, Value>,
+    summary: &str,
+) {
+    match agent_type {
+        "careful_read" => synthesize_careful_read_fields(object, summary),
+        "deep_read" => synthesize_deep_read_fields(object, summary),
+        "summary" => synthesize_summary_fields(object, summary),
+        _ => {}
+    }
+}
+
+fn derive_agent_summary(
+    agent_type: &str,
+    object: &serde_json::Map<String, Value>,
+) -> Result<String, AppError> {
+    match agent_type {
+        "summary" => object
+            .get("shortSummary")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                object
+                    .get("longSummary")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .or_else(|| {
+                object
+                    .get("presentationSummary")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .map(str::to_string)
+            .ok_or_else(|| AppError::SchemaInvalid("model output missing summary".into())),
+        _ => object
+            .get("summary")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| AppError::SchemaInvalid("model output missing summary".into())),
+    }
+}
+
+fn synthesize_careful_read_fields(object: &mut serde_json::Map<String, Value>, summary: &str) {
+    if object
+        .get("mainThreadSummary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_none_or(|value| value.is_empty())
+    {
+        let fallback = object
+            .get("summary")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(summary);
+        object.insert(
+            "mainThreadSummary".into(),
+            Value::String(truncate_text(fallback.trim(), 280)),
+        );
+    }
+
+    if object
+        .get("limitations")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
+    {
+        object.insert(
+            "limitations".into(),
+            Value::Array(vec![Value::String("The available evidence should be validated against the full method details and experiment setup.".into())]),
+        );
+    }
+
+    let final_advice = object
+        .entry("finalAdvice")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+
+    if !final_advice.is_object() {
+        *final_advice = Value::Object(serde_json::Map::new());
+    }
+
+    let final_advice_object = final_advice
+        .as_object_mut()
+        .expect("finalAdvice should be an object after normalization");
+    ensure_non_empty_string_field(final_advice_object, "oneSentenceValue", summary);
+    ensure_non_empty_string_field(final_advice_object, "bestToLearn", "Focus on the paper's core method, assumptions, and evaluation setup.");
+    ensure_non_empty_string_field(final_advice_object, "mostNeedCaution", "Check whether the reported results depend on narrow settings, hidden assumptions, or missing baselines.");
+    ensure_enum_field(
+        final_advice_object,
+        "nextDecision",
+        &["continue_deep_dive", "reference_only", "set_aside"],
+        "continue_deep_dive",
+    );
+}
+
+fn synthesize_deep_read_fields(object: &mut serde_json::Map<String, Value>, summary: &str) {
+    ensure_non_empty_string_field(
+        object,
+        "noveltyAssessment",
+        "The paper appears directionally useful, but its true novelty should be judged against adjacent prior work and baseline framing.",
+    );
+
+    if object
+        .get("coreResultSummary")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
+    {
+        object.insert(
+            "coreResultSummary".into(),
+            Value::Array(vec![Value::String(truncate_text(summary.trim(), 280))]),
+        );
+    }
+
+    if object
+        .get("limitations")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
+    {
+        object.insert(
+            "limitations".into(),
+            Value::Array(vec![Value::String("The claims still need validation against the full experimental setup, baseline choice, and scope conditions.".into())]),
+        );
+    }
+
+    let final_summary = object
+        .entry("finalSummary")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+
+    if !final_summary.is_object() {
+        *final_summary = Value::Object(serde_json::Map::new());
+    }
+
+    let final_summary_object = final_summary
+        .as_object_mut()
+        .expect("finalSummary should be an object after normalization");
+    ensure_non_empty_string_field(final_summary_object, "mostWorthLearning", summary);
+    ensure_non_empty_string_field(
+        final_summary_object,
+        "mostWorthQuestioning",
+        "Check whether the claimed novelty and performance gains remain strong under broader baselines and realistic assumptions.",
+    );
+    ensure_non_empty_string_field(
+        final_summary_object,
+        "researchValueForUser",
+        "Use this paper mainly as a source of method ideas, assumptions to compare, and evaluation design cues.",
+    );
+    if final_summary_object
+        .get("nextThreeActions")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
+    {
+        final_summary_object.insert(
+            "nextThreeActions".into(),
+            Value::Array(vec![
+                Value::String("Verify the main claim against the exact experimental setup and metric definitions.".into()),
+                Value::String("Compare the method and novelty claim with the strongest directly related prior work.".into()),
+                Value::String("Decide whether the paper is most useful for adoption, citation, or background framing.".into()),
+            ]),
+        );
+    }
+}
+
+fn synthesize_summary_fields(object: &mut serde_json::Map<String, Value>, summary: &str) {
+    ensure_non_empty_string_field(object, "shortSummary", truncate_text(summary.trim(), 220).as_str());
+    ensure_non_empty_string_field(object, "longSummary", summary);
+    ensure_non_empty_string_field(
+        object,
+        "presentationSummary",
+        "This paper is worth framing through its main claim, evidence scope, and practical limits.",
+    );
+
+    if object
+        .get("keyTakeaways")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
+    {
+        object.insert(
+            "keyTakeaways".into(),
+            Value::Array(vec![Value::String(truncate_text(summary.trim(), 220))]),
+        );
+    }
+
+    if object
+        .get("recommendedTags")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
+    {
+        object.insert(
+            "recommendedTags".into(),
+            Value::Array(vec![Value::String("needs_deep_read".into())]),
+        );
+    }
+}
+
+fn ensure_non_empty_string_field(
+    object: &mut serde_json::Map<String, Value>,
+    field: &str,
+    fallback: &str,
+) {
+    let has_value = object
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if !has_value {
+        object.insert(field.into(), Value::String(fallback.trim().to_string()));
+    }
+}
+
+fn ensure_enum_field(
+    object: &mut serde_json::Map<String, Value>,
+    field: &str,
+    allowed: &[&str],
+    fallback: &str,
+) {
+    let current = object.get(field).and_then(Value::as_str).map(str::trim);
+    if !current.is_some_and(|value| allowed.iter().any(|candidate| candidate == &value)) {
+        object.insert(field.into(), Value::String(fallback.to_string()));
+    }
 }
 
 fn normalize_evidence_list(value: Option<&Value>) -> Result<Vec<EvidenceItem>, AppError> {
@@ -1288,7 +1846,7 @@ async fn request_json_via_curl(
     payload: &Value,
 ) -> Result<RawModelHttpResponse, AppError> {
     let request_body = payload.to_string();
-    let output = Command::new("curl.exe")
+    let mut child = Command::new("curl.exe")
         .args([
             "--silent",
             "--show-error",
@@ -1310,12 +1868,26 @@ async fn request_json_via_curl(
             "-X",
             "POST",
             "-d",
-            &request_body,
+            "@-",
             url,
         ])
-        .output()
-        .await
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|error| AppError::UpstreamUnavailable(format!("failed to execute curl.exe: {error}")))?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(request_body.as_bytes())
+            .await
+            .map_err(|error| AppError::UpstreamUnavailable(format!("failed to write request body to curl.exe: {error}")))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|error| AppError::UpstreamUnavailable(format!("curl.exe failed while waiting for response: {error}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1662,7 +2234,14 @@ fn validate_enum(value: &str, allowed: &[&str], field: &str) -> Result<(), AppEr
 #[cfg(test)]
 mod tests {
     use super::{normalize_agent_output, AppError};
+    use crate::{
+        models::runtime::{GetAgentRunRequest, RunAgentRequest},
+        services::parse_service::ParseService,
+        repositories::{database::Database, model_repository::ModelRepository, paper_repository::PaperRepository, runtime_repository::RuntimeRepository},
+    };
     use serde_json::json;
+    use std::{env, fs, path::PathBuf, sync::Arc, thread, time::Duration};
+    use tauri::test::mock_app;
 
     #[test]
     fn quick_read_output_synthesizes_missing_handoff_summary() {
@@ -1726,7 +2305,311 @@ mod tests {
             }
         });
 
-        let error = normalize_agent_output("quick_read", parsed).expect_err("invalid handoff should fail");
+        let error = normalize_agent_output("quick_read", parsed).err().expect("invalid handoff should fail");
         assert!(matches!(error, AppError::SchemaInvalid(message) if message.contains("handoffSummary.compressedConclusion is required")));
+    }
+
+    #[test]
+    fn careful_read_output_synthesizes_missing_required_fields() {
+        let parsed = json!({
+            "summary": "The paper's main contribution is a structured method with plausible gains, but the evaluation assumptions still need checking.",
+            "evidence": [
+                {
+                    "quote": "Our method improves F1 by 3.8 over the strongest baseline.",
+                    "section": "Evaluation",
+                    "page": 7,
+                    "locator": "Evaluation paragraph 3"
+                }
+            ]
+        });
+
+        let normalized = normalize_agent_output("careful_read", parsed).expect("normalization should succeed");
+        let object = normalized
+            .output_json
+            .as_object()
+            .expect("normalized output should be an object");
+
+        assert!(object
+            .get("mainThreadSummary")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty()));
+        assert!(object
+            .get("limitations")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| !items.is_empty()));
+        assert_eq!(
+            object
+                .get("finalAdvice")
+                .and_then(|value| value.as_object())
+                .and_then(|value| value.get("nextDecision"))
+                .and_then(|value| value.as_str()),
+            Some("continue_deep_dive")
+        );
+    }
+
+    #[test]
+    fn deep_read_output_synthesizes_missing_required_fields() {
+        let parsed = json!({
+            "summary": "The paper proposes a potentially useful approach, but the actual novelty and robustness still need closer comparison and validation.",
+            "evidence": [
+                {
+                    "quote": "We outperform prior systems by 2.4 points on the main benchmark.",
+                    "section": "Results",
+                    "page": 8,
+                    "locator": "Results paragraph 2"
+                }
+            ]
+        });
+
+        let normalized = normalize_agent_output("deep_read", parsed).expect("normalization should succeed");
+        let object = normalized
+            .output_json
+            .as_object()
+            .expect("normalized output should be an object");
+
+        assert!(object
+            .get("noveltyAssessment")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty()));
+        assert!(object
+            .get("coreResultSummary")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| !items.is_empty()));
+        assert!(object
+            .get("limitations")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| !items.is_empty()));
+        assert!(object
+            .get("finalSummary")
+            .and_then(|value| value.as_object())
+            .and_then(|value| value.get("nextThreeActions"))
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| items.len() == 3));
+    }
+
+    #[test]
+    fn summary_output_synthesizes_missing_required_fields() {
+        let parsed = json!({
+            "longSummary": "The paper introduces a promising idea with enough signal to justify a deeper read, but the final judgment still depends on verifying the evidence and assumptions."
+        });
+
+        let normalized = normalize_agent_output("summary", parsed).expect("normalization should succeed");
+        let object = normalized
+            .output_json
+            .as_object()
+            .expect("normalized output should be an object");
+
+        assert_eq!(object.get("summary").and_then(|value| value.as_str()), object.get("shortSummary").and_then(|value| value.as_str()));
+        assert!(object
+            .get("presentationSummary")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty()));
+        assert!(object
+            .get("keyTakeaways")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| !items.is_empty()));
+        assert_eq!(
+            object
+                .get("recommendedTags")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+                .and_then(|value| value.as_str()),
+            Some("needs_deep_read")
+        );
+    }
+
+    #[tokio::test]
+    async fn live_quick_read_updates_batch_progress_and_persists_merged_output() {
+        let appdata = env::var("APPDATA").expect("APPDATA should be available on Windows");
+        let db_path = PathBuf::from(appdata).join("com.paperreader.app").join("app.db");
+        if !db_path.exists() {
+            panic!("live app database not found: {}", db_path.display());
+        }
+
+        let database = Arc::new(Database::open_for_tests(&db_path).expect("live app database should open"));
+
+        let model_repository = ModelRepository::new(database.clone());
+        let paper_repository = PaperRepository::new(database.clone());
+
+        let paper_id: String = database
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT p.id
+                         FROM papers p
+                         JOIN uploaded_files uf ON uf.paper_id = p.id
+                         LEFT JOIN workflow_states ws ON ws.paper_id = p.id
+                         WHERE uf.parse_status = 'succeeded'
+                         ORDER BY CASE WHEN ws.current_step = 'paper_ready' THEN 0 ELSE 1 END, p.updated_at DESC
+                         LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(AppError::from)
+            })
+            .expect("an already parsed paper should exist for live validation");
+
+        let model_config = model_repository
+            .get_runtime_config("quick_read")
+            .expect("runtime model config should exist");
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(45))
+            .build()
+            .expect("runtime client should build");
+
+        let mut last_overload_error: Option<String> = None;
+
+        for attempt in 1..=3 {
+            let polling_repository = RuntimeRepository::new(database.clone());
+            let run_handle = tokio::spawn({
+                let runtime_repository = RuntimeRepository::new(database.clone());
+                let paper_id = paper_id.clone();
+                let client = client.clone();
+                let model_config = model_config.clone();
+                async move {
+                    let request = RunAgentRequest {
+                        paper_id,
+                        agent_type: "quick_read".into(),
+                        user_question: Some("Validate section-aware batch execution and merged output.".into()),
+                        force: Some(true),
+                        source_run_ids: None,
+                        source_handoff_summary_ids: None,
+                        runtime_mode: Some("sectioned".into()),
+                        section_strategy: Some("agent_default".into()),
+                        max_sections_per_batch: Some(1),
+                        max_batches: Some(2),
+                        pinned_section_ids: None,
+                    };
+
+                    runtime_repository.create_run(request, &client, &model_config).await
+                }
+            });
+
+            let mut saw_progress_advance = false;
+
+            for _ in 0..40 {
+                if let Ok(Some(active_run)) = polling_repository.get_active_run(&paper_id) {
+                    if active_run.current_batch_count > 1 && active_run.current_batch_index >= 1 {
+                        saw_progress_advance = true;
+                    }
+
+                    let snapshot = paper_repository
+                        .get_reader_snapshot(&paper_id)
+                        .expect("reader snapshot should load during run");
+                    assert!(snapshot.active_run.is_some(), "reader snapshot should expose active run while executing");
+
+                    if active_run.current_batch_count > 1 && active_run.current_batch_index >= 2 {
+                        break;
+                    }
+                }
+
+                if run_handle.is_finished() {
+                    break;
+                }
+
+                thread::sleep(Duration::from_millis(250));
+            }
+
+            match run_handle.await.expect("live quick_read task should join") {
+                Ok(response) => {
+                    let detail = polling_repository
+                        .get_run(GetAgentRunRequest {
+                            run_id: response.run_id,
+                        })
+                        .expect("finished run detail should load");
+
+                    assert!(saw_progress_advance || detail.context_plan.as_ref().is_some_and(|plan| plan.batch_count <= 1), "expected batch progress to advance for multi-batch runs");
+                    assert_eq!(detail.status, "succeeded");
+
+                    let output_snapshot = detail.output_snapshot.expect("successful run should have output snapshot");
+                    let output_json: serde_json::Value = serde_json::from_str(&output_snapshot).expect("output snapshot should be valid JSON");
+                    assert_eq!(output_json.get("agentType").and_then(|value| value.as_str()), Some("quick_read"));
+                    assert!(output_json.get("summary").and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty()));
+
+                    if let Some(context_plan) = detail.context_plan.as_ref() {
+                        assert_eq!(context_plan.current_batch_index, context_plan.batch_count.max(1));
+                    }
+
+                    return;
+                }
+                Err(AppError::UpstreamUnavailable(message))
+                    if message.contains("system_cpu_overloaded") && attempt < 3 =>
+                {
+                    last_overload_error = Some(message);
+                    thread::sleep(Duration::from_secs(2));
+                }
+                Err(error) => panic!("live quick_read should succeed: {error:?}"),
+            }
+        }
+
+        panic!(
+            "live quick_read exhausted retries after transient upstream overloads: {}",
+            last_overload_error.unwrap_or_else(|| "unknown overload".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn live_reparse_updates_real_paper_sections_in_persisted_artifact() {
+        let appdata = env::var("APPDATA").expect("APPDATA should be available on Windows");
+        let db_path = PathBuf::from(&appdata).join("com.paperreader.app").join("app.db");
+        if !db_path.exists() {
+            panic!("live app database not found: {}", db_path.display());
+        }
+
+        let database = Arc::new(Database::open_for_tests(&db_path).expect("live app database should open"));
+        let parse_service = ParseService::new(database.clone());
+
+        let (paper_id, original_section_count, parsed_storage_path): (String, i32, String) = database
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT p.id, COALESCE(a.section_count, 0), a.storage_path
+                         FROM papers p
+                         JOIN parsed_paper_artifacts a ON a.paper_id = p.id
+                         JOIN uploaded_files uf ON uf.paper_id = p.id
+                         ORDER BY a.updated_at DESC, uf.created_at DESC
+                         LIMIT 1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .map_err(AppError::from)
+            })
+            .expect("a parsed paper should exist for live reparse validation");
+
+        let app = mock_app();
+        let handle = app.handle().clone();
+
+        parse_service
+            .parse_paper(&handle, &paper_id)
+            .await
+            .expect("live paper reparse should succeed");
+
+        let updated_section_count: i32 = database
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT section_count FROM parsed_paper_artifacts WHERE paper_id = ?1",
+                        rusqlite::params![paper_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(AppError::from)
+            })
+            .expect("updated parsed artifact metadata should exist");
+
+        let artifact = fs::read_to_string(&parsed_storage_path).expect("persisted parsed artifact should be readable");
+        let parsed: serde_json::Value = serde_json::from_str(&artifact).expect("persisted parsed artifact should be valid json");
+        let section_titles = parsed
+            .get("sections")
+            .and_then(|value| value.as_array())
+            .expect("persisted parsed artifact should include sections")
+            .iter()
+            .filter_map(|section| section.get("title").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>();
+
+        assert!(updated_section_count > 1, "expected section_count > 1 after reparse, got {updated_section_count}");
+        assert!(updated_section_count >= original_section_count, "expected section count to stay the same or improve after reparse");
+        assert!(section_titles.iter().any(|title| *title == "1. INTRODUCTION"), "expected persisted sections to include Introduction, got {section_titles:?}");
+        assert!(section_titles.iter().any(|title| *title == "2. THE PROPOSED METHOD"), "expected persisted sections to include method section, got {section_titles:?}");
     }
 }

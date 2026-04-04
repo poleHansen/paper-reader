@@ -26,6 +26,14 @@ impl Database {
         Ok(database)
     }
 
+    #[cfg(test)]
+    pub fn open_for_tests(db_path: &std::path::Path) -> Result<Self, AppError> {
+        let connection = Connection::open(db_path)?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+        })
+    }
+
     pub fn with_connection<T>(
         &self,
         operation: impl FnOnce(&Connection) -> Result<T, AppError>,
@@ -52,6 +60,11 @@ impl Database {
             let has_api_type = model_config_columns.iter().any(|column| column == "api_type");
             if !has_api_type {
                 connection.execute_batch("ALTER TABLE model_configs ADD COLUMN api_type TEXT;")?;
+            }
+            let has_display_name = model_config_columns.iter().any(|column| column == "display_name");
+            let has_is_recent = model_config_columns.iter().any(|column| column == "is_recent");
+            if !has_display_name || !has_is_recent {
+                connection.execute_batch(include_str!("../../migrations/0004_model_config_presets.sql"))?;
             }
             Ok(())
         })

@@ -12,21 +12,21 @@ endobj
 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
 endobj
 5 0 obj
-<< /Length 403 >>
+<< /Length 543 >>
 stream
 BT
 /F1 12 Tf
 72 760 Td
 14 TL
 (Paper Reader Sample) Tj
-T* (Abstract) Tj
+T* (1 Overview and Motivation) Tj
 T* (This is a local PDF fixture for parse pipeline validation.) Tj
-T* (Introduction) Tj
-T* (The parser should extract text and segment major sections.) Tj
-T* (Method) Tj
-T* (We generate a tiny PDF with embedded text operators.) Tj
-T* (Conclusion) Tj
-T* (Successful parsing should produce a JSON artifact and succeeded status.) Tj
+T* (2 System Design) Tj
+T* (The parser should extract text and segment major sections without relying on canonical names.) Tj
+T* (III Evaluation Notes) Tj
+T* (We generate a tiny PDF with embedded text operators and expect the parser to recover section boundaries.) Tj
+T* (FUTURE DIRECTIONS) Tj
+T* (Successful parsing should produce a JSON artifact and multiple structured sections.) Tj
 ET
 endstream
 endobj
@@ -41,5 +41,5 @@ xref
 trailer
 << /Size 6 /Root 1 0 R >>
 startxref
-765
+905
 %%EOF

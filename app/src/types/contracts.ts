@@ -39,6 +39,7 @@ export type SearchPapersResponse = {
 };
 
 export type ModelConfigRequest = {
+  displayName: string;
   provider: string;
   baseUrl: string;
   modelName: string;
@@ -48,16 +49,39 @@ export type ModelConfigRequest = {
   isDefault: boolean;
 };
 
+export type UpdateModelConfigRequest = ModelConfigRequest & {
+  id: string;
+};
+
 export type ModelConfigResponse = {
   id: string;
+  displayName: string;
   provider: string;
   baseUrl: string;
   modelName: string;
   apiType: string | null;
   agentType: string | null;
   isDefault: boolean;
+  isRecent: boolean;
   hasCredential: boolean;
   updatedAt: string;
+};
+
+export type ModelConfigDetailResponse = ModelConfigResponse & {
+  apiKey: string;
+};
+
+export type ModelConfigListResponse = {
+  items: ModelConfigResponse[];
+  recentId: string | null;
+};
+
+export type SelectModelConfigRequest = {
+  id: string;
+};
+
+export type DeleteModelConfigRequest = {
+  id: string;
 };
 
 export type TestModelConnectionRequest = {
@@ -159,7 +183,38 @@ export type ReaderSnapshot = {
   fallbackActions: string[];
   latestHandoffSummaryIds: string[];
   latestAgentRuns: AgentRunSummary[];
+  activeRun?: ActiveAgentRun | null;
   updatedAt: string;
+};
+
+export type ContextBatch = {
+  batchIndex: number;
+  sectionIds: string[];
+  sectionTitles: string[];
+  carryInSummaryIds: string[];
+  promptBudgetEstimate: number;
+};
+
+export type ContextPlan = {
+  runtimeMode: string;
+  sectionStrategy: string;
+  selectionReason: string;
+  selectedSectionIds: string[];
+  usedHandoffSummaryIds: string[];
+  batchCount: number;
+  currentBatchIndex: number;
+  truncated: boolean;
+  fallbackApplied: boolean;
+  batches: ContextBatch[];
+};
+
+export type ActiveAgentRun = {
+  id: string;
+  agentType: string;
+  status: string;
+  currentBatchIndex: number;
+  currentBatchCount: number;
+  contextPlan: ContextPlan;
 };
 
 export type AgentRunSummary = {
@@ -169,6 +224,7 @@ export type AgentRunSummary = {
   finishedAt: string | null;
   summary: string | null;
   handoffSummaryId: string | null;
+  contextPlan?: ContextPlan | null;
 };
 
 export type EvidenceItem = {
@@ -199,6 +255,11 @@ export type RunAgentRequest = {
   force?: boolean | null;
   sourceRunIds?: string[] | null;
   sourceHandoffSummaryIds?: string[] | null;
+  runtimeMode?: string | null;
+  sectionStrategy?: string | null;
+  maxSectionsPerBatch?: number | null;
+  maxBatches?: number | null;
+  pinnedSectionIds?: string[] | null;
 };
 
 export type RunAgentResponse = {
@@ -219,6 +280,7 @@ export type AgentRunDetail = {
   inputSnapshot: string;
   outputSnapshot: string | null;
   handoffSummary?: HandoffSummary | null;
+  contextPlan?: ContextPlan | null;
   errorCode: string | null;
   errorMessage: string | null;
   startedAt: string | null;

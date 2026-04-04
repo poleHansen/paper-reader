@@ -2,16 +2,22 @@ import { useEffect, useState } from 'react';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
   confirmPaperMetadata,
+  deleteModelConfig,
   getAgentRun,
+  getModelConfigDetail,
+  getRecentModelConfig,
   getPaperParseStatus,
   getProfile,
   getReaderSnapshot,
   importPaperFromFile,
   importPaperFromLink,
+  listModelConfigs,
   listLibraryItems,
   pickPdfFile,
   runAgent,
   saveModelConfig,
+  selectModelConfig,
+  updateModelConfig,
   updateLibraryItem,
   searchPapers,
   testModelConnection,
@@ -23,6 +29,9 @@ import type {
   EvidenceItem,
   LibraryItem,
   ModelConnectionResult,
+  ModelConfigDetailResponse,
+  ModelConfigListResponse,
+  ModelConfigResponse,
   ModelConfigRequest,
   PaperSearchResult,
   ReaderSnapshot,
@@ -57,7 +66,11 @@ export function App() {
   const [profile, setProfile] = useState<UserProfile>(defaultProfile);
   const [statusText, setStatusText] = useState('Ready');
   const [modelStatus, setModelStatus] = useState<ModelConnectionResult | null>(null);
+  const [savedModels, setSavedModels] = useState<ModelConfigResponse[]>([]);
+  const [selectedModelId, setSelectedModelId] = useState('');
+  const [showApiKey, setShowApiKey] = useState(false);
   const [modelDraft, setModelDraft] = useState<ModelConfigRequest>({
+    displayName: 'Default OpenAI-compatible',
     provider: 'openai_compatible',
     baseUrl: 'https://api.openai.com/v1',
     modelName: 'gpt-4.1-mini',
@@ -88,6 +101,7 @@ export function App() {
   useEffect(() => {
     void loadProfile();
     void refreshLibrary();
+    void loadSavedModels();
   }, []);
 
   useEffect(() => {
@@ -178,8 +192,100 @@ export function App() {
 
   async function handleSaveModel() {
     try {
-      await saveModelConfig(modelDraft);
-      setStatusText('Model config saved');
+      const saved = selectedModelId
+        ? await updateModelConfig({ id: selectedModelId, ...modelDraft })
+        : await saveModelConfig(modelDraft);
+      const detail = await getModelConfigDetail({ id: saved.id });
+      applySavedModel(detail);
+      await loadSavedModels(saved.id);
+      setShowApiKey(false);
+      setStatusText(`${selectedModelId ? 'Model preset updated' : 'Model preset saved'}: ${saved.displayName}`);
+    } catch (error) {
+      setStatusText(formatError(error));
+    }
+  }
+
+  async function loadSavedModels(preferredId?: string) {
+    try {
+      const [listResponse, recentResponse] = await Promise.allSettled([listModelConfigs(), getRecentModelConfig()]);
+      const list = listResponse.status === 'fulfilled' ? listResponse.value : ({ items: [], recentId: null } satisfies ModelConfigListResponse);
+      const recent = recentResponse.status === 'fulfilled' ? recentResponse.value : null;
+      setSavedModels(list.items);
+
+      const targetId = preferredId ?? recent?.id ?? list.recentId ?? list.items[0]?.id ?? '';
+      setSelectedModelId(targetId);
+
+      const targetModel = list.items.find((item) => item.id === targetId) ?? recent;
+      if (targetModel) {
+        const detail = await getModelConfigDetail({ id: targetModel.id });
+        applySavedModel(detail);
+      }
+    } catch (error) {
+      setStatusText(formatError(error));
+    }
+  }
+
+  function applySavedModel(model: ModelConfigDetailResponse) {
+    setModelDraft({
+      displayName: model.displayName,
+      provider: model.provider,
+      baseUrl: model.baseUrl,
+      modelName: model.modelName,
+      apiKey: model.apiKey,
+      apiType: model.apiType,
+      agentType: model.agentType,
+      isDefault: model.isDefault,
+    });
+    setSelectedModelId(model.id);
+    setShowApiKey(false);
+  }
+
+  async function handleSelectSavedModel(modelId: string) {
+    if (!modelId) {
+      setSelectedModelId('');
+      setModelDraft({
+        displayName: 'New OpenAI-compatible preset',
+        provider: 'openai_compatible',
+        baseUrl: 'https://api.openai.com/v1',
+        modelName: 'gpt-4.1-mini',
+        apiKey: '',
+        apiType: 'chat_completions',
+        agentType: null,
+        isDefault: true,
+      });
+      return;
+    }
+
+    try {
+      const selected = await selectModelConfig({ id: modelId });
+      const detail = await getModelConfigDetail({ id: selected.id });
+      applySavedModel(detail);
+      await loadSavedModels(selected.id);
+      setStatusText(`Selected model preset: ${selected.displayName}`);
+    } catch (error) {
+      setStatusText(formatError(error));
+    }
+  }
+
+  async function handleDeleteSelectedModel() {
+    if (!selectedModelId) {
+      setStatusText('Select a saved preset to delete');
+      return;
+    }
+
+    try {
+      const deletingName = savedModels.find((item) => item.id === selectedModelId)?.displayName ?? 'preset';
+      const confirmed = window.confirm(`Delete model preset \"${deletingName}\"? This cannot be undone.`);
+      if (!confirmed) {
+        setStatusText('Preset deletion canceled');
+        return;
+      }
+
+      await deleteModelConfig({ id: selectedModelId });
+      setSelectedModelId('');
+      setModelStatus(null);
+      await loadSavedModels();
+      setStatusText(`Deleted model preset: ${deletingName}`);
     } catch (error) {
       setStatusText(formatError(error));
     }
@@ -258,6 +364,9 @@ export function App() {
     try {
       const snapshot = await getReaderSnapshot({ paperId });
       setReaderSnapshot(snapshot);
+      if (snapshot.activeRun) {
+        setStatusText(`${snapshot.activeRun.agentType} is running, batch ${snapshot.activeRun.currentBatchIndex}/${snapshot.activeRun.currentBatchCount}`);
+      }
       if (activeRun && activeRun.paperId !== paperId) {
         setActiveRun(null);
       }
@@ -490,7 +599,7 @@ export function App() {
         ) : null}
 
         {activeView === 'onboarding' ? (
-          <section className="card pageCard">
+          <section className="card pageCard pageCardReader">
             <div className="sectionHeader">
               <div>
                 <span className="eyebrow">First run</span>
@@ -512,7 +621,7 @@ export function App() {
         ) : null}
 
         {activeView === 'search' ? (
-          <section className="card pageCard">
+          <section className="card pageCard pageCardReader">
             <div className="sectionHeader">
               <div>
                 <span className="eyebrow">Search</span>
@@ -622,7 +731,7 @@ export function App() {
                   <span>Size: {readerSnapshot.sizeBytes ?? 0} bytes</span>
                 </section>
 
-                <section className="readerPanel">
+                <section className="readerPanel readerPanelScrollable">
                   <span className="eyebrow">Workflow</span>
                   <strong>Parse: {readerSnapshot.parseStatus}</strong>
                   <span>Progress: {readerSnapshot.parseProgress}%</span>
@@ -648,12 +757,20 @@ export function App() {
                   {readerSnapshot.parseErrorMessage ? <span>Error: {readerSnapshot.parseErrorMessage}</span> : null}
                 </section>
 
-                <section className="readerPanel">
+                <section className="readerPanel readerPanelScrollable readerPanelAnalysis">
                   <span className="eyebrow">Analysis</span>
                   <p>{readerSnapshot.abstractText ?? 'No abstract available yet. This paper is waiting for the parse pipeline and agent runtime.'}</p>
                   <span>Tags: {readerSnapshot.libraryTags.length > 0 ? readerSnapshot.libraryTags.join(', ') : 'none'}</span>
                   <span>Latest handoff ids: {readerSnapshot.latestHandoffSummaryIds.join(', ') || 'none yet'}</span>
                   <span>Fallback actions: {readerSnapshot.fallbackActions.join(', ') || 'none'}</span>
+                  {readerSnapshot.activeRun ? (
+                    <div className="detailGroup">
+                      <span className="detailLabel">Active batch run</span>
+                      <span>{readerSnapshot.activeRun.agentType} · 第 {readerSnapshot.activeRun.currentBatchIndex} / {readerSnapshot.activeRun.currentBatchCount} 批分析中</span>
+                      <span>Sections: {readerSnapshot.activeRun.contextPlan.selectedSectionIds.join(', ') || 'none'}</span>
+                      <span>Mode: {readerSnapshot.activeRun.contextPlan.runtimeMode} / {readerSnapshot.activeRun.contextPlan.sectionStrategy}</span>
+                    </div>
+                  ) : null}
                   {readerSnapshot.latestAgentRuns.length > 0 ? (
                     <div className="runList">
                       {readerSnapshot.latestAgentRuns.map((run) => (
@@ -668,6 +785,7 @@ export function App() {
                         >
                           <strong>{run.agentType}</strong>
                           <span>{run.status}</span>
+                          <span>{run.contextPlan ? `sections ${run.contextPlan.selectedSectionIds.length}, batches ${run.contextPlan.batchCount}` : 'no context plan'}</span>
                           <span>{run.summary ?? 'No summary yet'}</span>
                         </button>
                       ))}
@@ -678,6 +796,15 @@ export function App() {
                       <strong>{activeRun.agentType}</strong>
                       <span>Status: {activeRun.status}</span>
                       <span>Finished: {activeRun.finishedAt ?? 'n/a'}</span>
+                      {activeRun.contextPlan ? (
+                        <div className="detailGroup">
+                          <span className="detailLabel">Context plan</span>
+                          <span>Mode: {activeRun.contextPlan.runtimeMode}</span>
+                          <span>Strategy: {activeRun.contextPlan.sectionStrategy}</span>
+                          <span>Sections: {activeRun.contextPlan.selectedSectionIds.join(', ') || 'none'}</span>
+                          <span>Batch progress: {activeRun.contextPlan.currentBatchIndex} / {activeRun.contextPlan.batchCount}</span>
+                        </div>
+                      ) : null}
                       {activeRun.status === 'failed' ? (
                         <div className="detailGroup">
                           <span className="detailLabel">Failure details</span>
@@ -791,8 +918,19 @@ export function App() {
           <section className="card pageCard">
             <span className="eyebrow">Model settings</span>
             <h2>Connection baseline</h2>
-            <p className="muted">Reader runtime now uses the saved model config directly. Save a real OpenAI-compatible endpoint and API key before running agents.</p>
+            <p className="muted">Reader runtime now restores the most recently selected saved model. You can give presets a name, save multiple endpoints, and switch between them later.</p>
             <div className="formGrid">
+              <select value={selectedModelId} onChange={(event) => void handleSelectSavedModel(event.target.value)}>
+                <option value="">Create a new model preset</option>
+                {savedModels.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.displayName}{item.isRecent ? ' (recent)' : ''}{item.isDefault ? ' (default)' : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="formGrid">
+              <input value={modelDraft.displayName} onChange={(event) => setModelDraft({ ...modelDraft, displayName: event.target.value })} placeholder="preset name" />
               <input value={modelDraft.provider} onChange={(event) => setModelDraft({ ...modelDraft, provider: event.target.value })} placeholder="provider" />
               <input value={modelDraft.baseUrl} onChange={(event) => setModelDraft({ ...modelDraft, baseUrl: event.target.value })} placeholder="base url" />
               <input value={modelDraft.modelName} onChange={(event) => setModelDraft({ ...modelDraft, modelName: event.target.value })} placeholder="model name" />
@@ -801,15 +939,21 @@ export function App() {
                 <option value="responses">responses</option>
               </select>
               <input value={modelDraft.agentType ?? ''} onChange={(event) => setModelDraft({ ...modelDraft, agentType: event.target.value || null })} placeholder="agent type override (optional)" />
-              <input type="password" value={modelDraft.apiKey} onChange={(event) => setModelDraft({ ...modelDraft, apiKey: event.target.value })} placeholder="api key" />
+              <div className="row">
+                <input type={showApiKey ? 'text' : 'password'} value={modelDraft.apiKey} onChange={(event) => setModelDraft({ ...modelDraft, apiKey: event.target.value })} placeholder="api key" />
+                <button className="secondaryButton" type="button" onClick={() => setShowApiKey((current) => !current)}>
+                  {showApiKey ? 'Hide key' : 'Show key'}
+                </button>
+              </div>
               <select value={modelDraft.isDefault ? 'yes' : 'no'} onChange={(event) => setModelDraft({ ...modelDraft, isDefault: event.target.value === 'yes' })}>
                 <option value="yes">Use as default runtime config</option>
                 <option value="no">Store as agent-specific config only</option>
               </select>
             </div>
             <div className="row rowWrap">
-              <button onClick={() => void handleSaveModel()}>Save config</button>
+              <button onClick={() => void handleSaveModel()}>{selectedModelId ? 'Update preset' : 'Save preset'}</button>
               <button className="secondaryButton" onClick={() => void handleTestModel()}>Test endpoint</button>
+              {selectedModelId ? <button className="secondaryButton" onClick={() => void handleDeleteSelectedModel()}>Delete preset</button> : null}
             </div>
             {modelStatus ? (
               <div className="listItem topGap">

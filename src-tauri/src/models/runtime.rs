@@ -2,6 +2,31 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ContextBatch {
+    pub batch_index: i32,
+    pub section_ids: Vec<String>,
+    pub section_titles: Vec<String>,
+    pub carry_in_summary_ids: Vec<String>,
+    pub prompt_budget_estimate: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextPlan {
+    pub runtime_mode: String,
+    pub section_strategy: String,
+    pub selection_reason: String,
+    pub selected_section_ids: Vec<String>,
+    pub used_handoff_summary_ids: Vec<String>,
+    pub batch_count: i32,
+    pub current_batch_index: i32,
+    pub truncated: bool,
+    pub fallback_applied: bool,
+    pub batches: Vec<ContextBatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EvidenceItem {
     pub quote: String,
     pub section: String,
@@ -18,6 +43,11 @@ pub struct RunAgentRequest {
     pub force: Option<bool>,
     pub source_run_ids: Option<Vec<String>>,
     pub source_handoff_summary_ids: Option<Vec<String>>,
+    pub runtime_mode: Option<String>,
+    pub section_strategy: Option<String>,
+    pub max_sections_per_batch: Option<i32>,
+    pub max_batches: Option<i32>,
+    pub pinned_section_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,6 +73,7 @@ pub struct AgentRunSummary {
     pub finished_at: Option<String>,
     pub summary: Option<String>,
     pub handoff_summary_id: Option<String>,
+    pub context_plan: Option<ContextPlan>,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,6 +102,7 @@ pub struct AgentRunDetailResponse {
     pub input_snapshot: String,
     pub output_snapshot: Option<String>,
     pub handoff_summary: Option<HandoffSummaryResponse>,
+    pub context_plan: Option<ContextPlan>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub started_at: Option<String>,
