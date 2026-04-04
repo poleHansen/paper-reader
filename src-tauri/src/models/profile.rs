@@ -9,6 +9,12 @@ pub struct UpsertProfileRequest {
     pub reading_goal: String,
     pub output_language: String,
     pub experience_level: String,
+    pub github_repo_owner: Option<String>,
+    pub github_repo_name: Option<String>,
+    pub github_repo_branch: Option<String>,
+    pub github_repo_path_prefix: Option<String>,
+    pub github_cdn_base_url: Option<String>,
+    pub github_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -21,5 +27,19 @@ pub struct ProfileResponse {
     pub reading_goal: String,
     pub output_language: String,
     pub experience_level: String,
+    pub github_repo_owner: Option<String>,
+    pub github_repo_name: Option<String>,
+    pub github_repo_branch: Option<String>,
+    pub github_repo_path_prefix: Option<String>,
+    pub github_cdn_base_url: Option<String>,
+    pub has_github_token: bool,
     pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubUploadTestResponse {
+    pub public_url: String,
+    pub repository_path: String,
+    pub message: String,
 }

@@ -1,3 +1,5 @@
+import { z } from 'zod';
+
 const agentRunSummarySchema = z.object({
   id: z.string(),
   agentType: z.string(),
@@ -12,6 +14,8 @@ const contextBatchSchema = z.object({
   batchIndex: z.number(),
   sectionIds: z.array(z.string()),
   sectionTitles: z.array(z.string()),
+  figureIds: z.array(z.string()).default([]),
+  tableIds: z.array(z.string()).default([]),
   carryInSummaryIds: z.array(z.string()),
   promptBudgetEstimate: z.number(),
 });
@@ -24,7 +28,10 @@ const contextPlanSchema = z.object({
   backfillReason: z.string().nullable(),
   gapCategories: z.array(z.string()),
   selectedSectionIds: z.array(z.string()),
+  selectedFigureIds: z.array(z.string()).default([]),
+  selectedTableIds: z.array(z.string()).default([]),
   usedHandoffSummaryIds: z.array(z.string()),
+  visualMode: z.string().default('disabled'),
   batchCount: z.number(),
   currentBatchIndex: z.number(),
   truncated: z.boolean(),
@@ -42,10 +49,79 @@ const activeAgentRunSchema = z.object({
 });
 
 const evidenceItemSchema = z.object({
+  sourceType: z.string().default('section_text'),
+  sourceObjectId: z.string().nullable().default(null),
   quote: z.string(),
   section: z.string(),
   page: z.number().nullable(),
   locator: z.string(),
+});
+
+const visualDiagnosticSchema = z.object({
+  scope: z.string(),
+  code: z.string(),
+  message: z.string(),
+  retryable: z.boolean(),
+});
+
+const parsedContentSummarySchema = z.object({
+  version: z.number(),
+  storagePath: z.string(),
+  fullTextAvailable: z.boolean(),
+  sectionCount: z.number(),
+  figureCount: z.number(),
+  tableCount: z.number(),
+  visualEnabled: z.boolean(),
+  visualMode: z.string(),
+  visualSummaryCount: z.number(),
+  sampleCaption: z.string().nullable(),
+  sampleSummary: z.string().nullable(),
+  visualWarnings: z.array(z.string()),
+  githubUploadDiagnostics: z.array(visualDiagnosticSchema).default([]),
+  visualDiagnostics: z.array(visualDiagnosticSchema).default([]),
+});
+
+const parsedFigureSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  title: z.string().nullable(),
+  caption: z.string(),
+  page: z.number().nullable(),
+  sectionId: z.string().nullable(),
+  locator: z.string(),
+  imagePath: z.string(),
+  thumbnailPath: z.string().nullable(),
+  ocrText: z.array(z.string()),
+  summary: z.string().nullable(),
+  confidence: z.number().nullable(),
+});
+
+const parsedTableSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  title: z.string().nullable(),
+  caption: z.string(),
+  page: z.number().nullable(),
+  sectionId: z.string().nullable(),
+  locator: z.string(),
+  imagePath: z.string(),
+  thumbnailPath: z.string().nullable(),
+  ocrText: z.array(z.string()),
+  markdownTable: z.string().nullable(),
+  summary: z.string().nullable(),
+  confidence: z.number().nullable(),
+});
+
+const parsedVisualEvidenceSchema = z.object({
+  id: z.string(),
+  sourceObjectId: z.string(),
+  sourceObjectType: z.string(),
+  claim: z.string(),
+  supportLevel: z.string(),
+  evidenceText: z.string(),
+  page: z.number().nullable(),
+  locator: z.string(),
+  confidence: z.number().nullable(),
 });
 
 const handoffSummarySchema = z.object({
@@ -61,8 +137,6 @@ const handoffSummarySchema = z.object({
   nextStepSuggestion: z.string(),
   generatedAt: z.string(),
 });
-
-import { z } from 'zod';
 
 export const paperSearchItemSchema = z.object({
   id: z.string(),
@@ -93,8 +167,20 @@ export const profileResponseSchema = z.object({
   readingGoal: z.string(),
   outputLanguage: z.string(),
   experienceLevel: z.string(),
+  githubRepoOwner: z.string().nullable(),
+  githubRepoName: z.string().nullable(),
+  githubRepoBranch: z.string().nullable(),
+  githubRepoPathPrefix: z.string().nullable(),
+  githubCdnBaseUrl: z.string().nullable(),
+  hasGithubToken: z.boolean().optional(),
   id: z.string(),
   updatedAt: z.string(),
+});
+
+export const githubUploadTestResponseSchema = z.object({
+  publicUrl: z.string(),
+  repositoryPath: z.string(),
+  message: z.string(),
 });
 
 export const modelConfigResponseSchema = z.object({
@@ -104,6 +190,7 @@ export const modelConfigResponseSchema = z.object({
   baseUrl: z.string(),
   modelName: z.string(),
   apiType: z.string().nullable(),
+  imageInputFormat: z.string().nullable(),
   agentType: z.string().nullable(),
   isDefault: z.boolean(),
   isRecent: z.boolean(),
@@ -128,6 +215,10 @@ export const modelConnectionResponseSchema = z.object({
   endpoint: z.string(),
   statusCode: z.number().nullable(),
   statusText: z.string(),
+  imageInputSupported: z.boolean(),
+  imageInputMessage: z.string(),
+  imageInputWorkingFormat: z.string().nullable(),
+  imageProbeAttemptedFormats: z.array(z.string()),
 });
 
 export const importPaperFromFileResponseSchema = z.object({
@@ -177,6 +268,7 @@ export const readerSnapshotSchema = z.object({
   uploadedFileId: z.string().nullable(),
   mimeType: z.string().nullable(),
   sizeBytes: z.number().nullable(),
+  parsedContent: parsedContentSummarySchema.nullable().optional(),
   workflowCurrentStep: z.string(),
   nextActionRequired: z.string().nullable(),
   allowedActions: z.array(z.string()),
@@ -185,6 +277,16 @@ export const readerSnapshotSchema = z.object({
   latestAgentRuns: z.array(agentRunSummarySchema),
   activeRun: activeAgentRunSchema.nullable().optional(),
   updatedAt: z.string(),
+});
+
+export const paperVisualArtifactsResponseSchema = z.object({
+  paperId: z.string(),
+  version: z.number(),
+  figures: z.array(parsedFigureSchema),
+  tables: z.array(parsedTableSchema),
+  visualEvidence: z.array(parsedVisualEvidenceSchema),
+  githubUploadDiagnostics: z.array(visualDiagnosticSchema).default([]),
+  visualDiagnostics: z.array(visualDiagnosticSchema).default([]),
 });
 
 export const runAgentResponseSchema = z.object({

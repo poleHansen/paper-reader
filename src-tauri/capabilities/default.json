@@ -1,0 +1,6 @@
+{
+  "identifier": "main-capability",
+  "description": "Default capability for the main Paper Reader window.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

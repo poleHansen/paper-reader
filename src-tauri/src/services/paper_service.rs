@@ -7,13 +7,14 @@ use uuid::Uuid;
 use crate::{
     errors::AppError,
     models::paper::{
-        ConfirmPaperMetadataRequest, ConfirmPaperMetadataResponse, GetPaperParseStatusRequest, GetReaderSnapshotRequest,
-        ImportPaperFromFileRequest, ImportPaperFromFileResponse, ImportPaperFromLinkRequest, PaperParseStatusResponse,
-        ReaderSnapshotResponse, SearchPapersRequest, SearchPapersResponse,
+        ConfirmPaperMetadataRequest, ConfirmPaperMetadataResponse, GetPaperParseStatusRequest, GetPaperVisualArtifactsRequest,
+        GetReaderSnapshotRequest, ImportPaperFromFileRequest, ImportPaperFromFileResponse, ImportPaperFromLinkRequest,
+        PaperParseStatusResponse, PaperVisualArtifactsResponse, ReaderSnapshotResponse, SearchPapersRequest,
+        SearchPapersResponse,
     },
     providers::arxiv_provider::ArxivProvider,
     repositories::{database::Database, paper_repository::PaperRepository},
-    services::parse_service::ParseService,
+    services::{github_asset_service::GitHubAssetService, parse_service::ParseService},
 };
 
 pub struct PaperService {
@@ -24,11 +25,11 @@ pub struct PaperService {
 }
 
 impl PaperService {
-    pub fn new(database: Arc<Database>) -> Self {
+    pub fn new(database: Arc<Database>, github_asset_service: Arc<GitHubAssetService>) -> Self {
         Self {
             repository: PaperRepository::new(database.clone()),
             arxiv_provider: ArxivProvider::new().expect("arxiv provider should build"),
-            parse_service: ParseService::new(database.clone()),
+            parse_service: ParseService::new(database.clone(), github_asset_service),
             database,
         }
     }
@@ -143,15 +144,17 @@ impl PaperService {
             return Err(AppError::Validation("paperId cannot be empty".into()));
         }
         let response = self.repository.confirm_metadata(request)?;
-        let parse_service = self.parse_service.clone();
-        let app_handle = app.clone();
-        let paper_id = response.paper_id.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(error) = parse_service.parse_paper(&app_handle, &paper_id).await {
-                tracing::error!(paper_id = %paper_id, error = %error, "paper parse pipeline failed");
-            }
-        });
+        self.spawn_parse(app, response.paper_id.clone());
         Ok(response)
+    }
+
+    pub async fn reparse_paper(&self, app: &AppHandle, paper_id: String) -> Result<(), AppError> {
+        if paper_id.trim().is_empty() {
+            return Err(AppError::Validation("paperId cannot be empty".into()));
+        }
+        self.repository.reset_parse_status(&paper_id)?;
+        self.spawn_parse(app, paper_id);
+        Ok(())
     }
 
     pub async fn get_paper_parse_status(
@@ -172,6 +175,26 @@ impl PaperService {
             return Err(AppError::Validation("paperId cannot be empty".into()));
         }
         self.repository.get_reader_snapshot(&request.paper_id)
+    }
+
+    pub async fn get_paper_visual_artifacts(
+        &self,
+        request: GetPaperVisualArtifactsRequest,
+    ) -> Result<PaperVisualArtifactsResponse, AppError> {
+        if request.paper_id.trim().is_empty() {
+            return Err(AppError::Validation("paperId cannot be empty".into()));
+        }
+        self.repository.get_paper_visual_artifacts(&request.paper_id)
+    }
+
+    fn spawn_parse(&self, app: &AppHandle, paper_id: String) {
+        let parse_service = self.parse_service.clone();
+        let app_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = parse_service.parse_paper(&app_handle, &paper_id).await {
+                tracing::error!(paper_id = %paper_id, error = %error, "paper parse pipeline failed");
+            }
+        });
     }
 }
 

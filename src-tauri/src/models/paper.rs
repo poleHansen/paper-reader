@@ -1,4 +1,7 @@
-use crate::models::runtime::{AgentRunSummary, ContextPlan};
+use crate::models::{
+    parsed_content::{ParsedFigure, ParsedTable, ParsedVisualEvidence, VisualDiagnostic},
+    runtime::{AgentRunSummary, ContextPlan},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -131,6 +134,7 @@ pub struct ReaderSnapshotResponse {
     pub uploaded_file_id: Option<String>,
     pub mime_type: Option<String>,
     pub size_bytes: Option<i64>,
+    pub parsed_content: Option<ParsedContentSummary>,
     pub workflow_current_step: String,
     pub next_action_required: Option<String>,
     pub allowed_actions: Vec<String>,
@@ -139,6 +143,43 @@ pub struct ReaderSnapshotResponse {
     pub latest_agent_runs: Vec<AgentRunSummary>,
     pub active_run: Option<ActiveAgentRunResponse>,
     pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedContentSummary {
+    pub version: i32,
+    pub storage_path: String,
+    pub full_text_available: bool,
+    pub section_count: i32,
+    pub figure_count: i32,
+    pub table_count: i32,
+    pub visual_enabled: bool,
+    pub visual_mode: String,
+    pub visual_summary_count: i32,
+    pub sample_caption: Option<String>,
+    pub sample_summary: Option<String>,
+    pub visual_warnings: Vec<String>,
+    pub github_upload_diagnostics: Vec<VisualDiagnostic>,
+    pub visual_diagnostics: Vec<VisualDiagnostic>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetPaperVisualArtifactsRequest {
+    pub paper_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaperVisualArtifactsResponse {
+    pub paper_id: String,
+    pub version: i32,
+    pub figures: Vec<ParsedFigure>,
+    pub tables: Vec<ParsedTable>,
+    pub visual_evidence: Vec<ParsedVisualEvidence>,
+    pub github_upload_diagnostics: Vec<VisualDiagnostic>,
+    pub visual_diagnostics: Vec<VisualDiagnostic>,
 }
 
 #[derive(Debug, Serialize)]

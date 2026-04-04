@@ -774,6 +774,354 @@ pub struct ModelEndpointProbeResult {
     pub api_label: String,
 }
 
+pub struct ModelImageProbeResult {
+    pub supported: bool,
+    pub message: String,
+    pub status_code: Option<u16>,
+    pub working_format: Option<String>,
+    pub attempted_formats: Vec<String>,
+}
+
+struct ImageProbePayloadVariant {
+    label: &'static str,
+    payload: Value,
+}
+
+pub struct MultimodalPayloadVariant {
+    pub label: &'static str,
+    pub payload: Value,
+}
+
+pub fn prioritize_multimodal_payload_variants(
+    mut variants: Vec<MultimodalPayloadVariant>,
+    preferred_format: Option<&str>,
+) -> Vec<MultimodalPayloadVariant> {
+    if let Some(preferred_format) = preferred_format {
+        if let Some(index) = variants.iter().position(|variant| variant.label == preferred_format) {
+            let preferred = variants.remove(index);
+            variants.insert(0, preferred);
+        }
+    }
+
+    variants
+}
+
+fn is_image_probe_rejection(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("image")
+        || normalized.contains("vision")
+        || normalized.contains("input_image")
+        || normalized.contains("image_url")
+        || normalized.contains("unsupported content type")
+        || normalized.contains("invalid image")
+        || normalized.contains("http 400")
+    || normalized.contains("http 502")
+    || normalized.contains("bad gateway")
+    || normalized.contains("gateway")
+}
+
+fn format_image_probe_rejection(api_type: &str, status_code: Option<u16>, message: &str) -> String {
+    let trimmed = message.trim();
+    let label = api_label(api_type);
+
+    if let Some(code) = status_code {
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(&format!("HTTP {code}:")) {
+            return format!(
+                "{} text probe succeeded, but the image probe was rejected with HTTP {} and no response body. The model may support images, but this gateway did not accept the current multimodal payload format.",
+                label, code
+            );
+        }
+    }
+
+    format!("{} text probe succeeded, but the image probe was rejected by the gateway: {}", label, trimmed)
+}
+
+fn format_image_probe_success(api_type: &str, variant_label: &str) -> String {
+    format!(
+        "{} image probe succeeded using the {} payload format.",
+        api_label(api_type),
+        variant_label
+    )
+}
+
+fn format_image_probe_variant_rejection(
+    api_type: &str,
+    variant_label: &str,
+    status_code: Option<u16>,
+    message: &str,
+) -> String {
+    format!(
+        "{} failed: {}",
+        variant_label,
+        format_image_probe_rejection(api_type, status_code, message)
+    )
+}
+
+fn format_image_probe_fallback_summary(api_type: &str, rejection_messages: &[String]) -> String {
+    let joined = rejection_messages.join(" ").to_ascii_lowercase();
+    if joined.contains("expected a valid url") || joined.contains("invalid format") {
+        return format!(
+            "{} text probe succeeded, but this gateway appears to require a publicly reachable image URL for multimodal input. Inline data URLs and raw base64 were rejected.",
+            api_label(api_type)
+        );
+    }
+    if joined.contains("upstream request failed") && joined.contains("http 502") {
+        return format!(
+            "{} text probe succeeded, but multimodal image requests consistently failed upstream after gateway forwarding. This endpoint appears to support text only, or the upstream vision model is unavailable for this route.",
+            api_label(api_type)
+        );
+    }
+    if joined.contains("does not represent a valid image") {
+        return format!(
+            "{} text probe succeeded, but this gateway rejected inline image payloads as invalid image data. The upstream may only accept externally hosted image URLs or may not support image forwarding on this endpoint.",
+            api_label(api_type)
+        );
+    }
+
+    if rejection_messages.is_empty() {
+        return format!(
+            "{} text probe succeeded, but every image probe payload variant failed without a classified rejection.",
+            api_label(api_type)
+        );
+    }
+
+    format!(
+        "{} text probe succeeded, but all image probe payload variants were rejected by the gateway. {}",
+        api_label(api_type),
+        rejection_messages.join(" ")
+    )
+}
+
+pub fn build_multimodal_payload_variants(
+    model_name: &str,
+    prompt: &str,
+    image_data_url: &str,
+    api_type: &str,
+) -> Vec<MultimodalPayloadVariant> {
+    let image_base64 = image_data_url
+        .split_once(",")
+        .map(|(_, data)| data)
+        .unwrap_or(image_data_url);
+
+    if api_type == "responses" {
+        return vec![
+            MultimodalPayloadVariant {
+                label: "responses input_image string",
+                payload: json!({
+                    "model": model_name,
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": prompt,
+                                },
+                                {
+                                    "type": "input_image",
+                                    "image_url": image_data_url,
+                                }
+                            ]
+                        }
+                    ],
+                    "temperature": 0.0,
+                }),
+            },
+            MultimodalPayloadVariant {
+                label: "responses input_image object",
+                payload: json!({
+                    "model": model_name,
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": prompt,
+                                },
+                                {
+                                    "type": "input_image",
+                                    "image_url": {
+                                        "url": image_data_url,
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    "temperature": 0.0,
+                }),
+            },
+            MultimodalPayloadVariant {
+                label: "responses input_image base64",
+                payload: json!({
+                    "model": model_name,
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": prompt,
+                                },
+                                {
+                                    "type": "input_image",
+                                    "image_base64": image_base64,
+                                }
+                            ]
+                        }
+                    ],
+                    "temperature": 0.0,
+                }),
+            },
+        ];
+    }
+
+    vec![
+        MultimodalPayloadVariant {
+            label: "chat image_url object",
+            payload: json!({
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt,
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": image_data_url,
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "temperature": 0.0,
+            }),
+        },
+        MultimodalPayloadVariant {
+            label: "chat image_url object with base64 data",
+            payload: json!({
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt,
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": image_base64,
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "temperature": 0.0,
+            }),
+        },
+        MultimodalPayloadVariant {
+            label: "chat image_url string",
+            payload: json!({
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt,
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": image_data_url,
+                            }
+                        ]
+                    }
+                ],
+                "temperature": 0.0,
+            }),
+        },
+        MultimodalPayloadVariant {
+            label: "chat image_url string with base64 data",
+            payload: json!({
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt,
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": image_base64,
+                            }
+                        ]
+                    }
+                ],
+                "temperature": 0.0,
+            }),
+        },
+        MultimodalPayloadVariant {
+            label: "chat image_url object with detail auto",
+            payload: json!({
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt,
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": image_data_url,
+                                    "detail": "auto",
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "temperature": 0.0,
+            }),
+        },
+        MultimodalPayloadVariant {
+            label: "chat image_url object with detail auto and base64 data",
+            payload: json!({
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt,
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": image_base64,
+                                    "detail": "auto",
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "temperature": 0.0,
+            }),
+        },
+    ]
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatUsage {
     prompt_tokens: i64,
@@ -1005,6 +1353,8 @@ fn build_context_plan(
                 .filter_map(|section_id| parsed_content.sections.iter().find(|section| &section.id == section_id))
                 .map(|section| section.title.clone())
                 .collect(),
+            figure_ids: Vec::new(),
+            table_ids: Vec::new(),
             carry_in_summary_ids: used_handoff_summary_ids.clone(),
             prompt_budget_estimate: estimate_batch_prompt_budget(batch_sections, parsed_content),
         })
@@ -1024,7 +1374,10 @@ fn build_context_plan(
         backfill_reason,
         gap_categories,
         selected_section_ids: selected_sections,
+        selected_figure_ids: Vec::new(),
+        selected_table_ids: Vec::new(),
         used_handoff_summary_ids,
+        visual_mode: "disabled".to_string(),
         batch_count: batches.len() as i32,
         current_batch_index: 0,
         truncated: truncated_selected,
@@ -1866,6 +2219,8 @@ fn normalize_evidence_list(value: Option<&Value>) -> Result<Vec<EvidenceItem>, A
             continue;
         }
         evidence.push(EvidenceItem {
+            source_type: "section_text".to_string(),
+            source_object_id: None,
             quote,
             section: object
                 .get("section")
@@ -2168,6 +2523,97 @@ pub async fn probe_model_endpoint(
     })
 }
 
+pub async fn probe_model_image_support(
+    model_config: &StoredModelConfig,
+) -> Result<ModelImageProbeResult, AppError> {
+    let api_key = model_config
+        .api_key
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AppError::Validation("selected model config has no API key stored in keyring".into()))?;
+    let resolved_api_type = normalize_api_type(model_config.api_type.as_deref(), &model_config.base_url);
+    let endpoint = build_endpoint(&model_config.base_url, &resolved_api_type);
+    let payload_variants = build_image_probe_payload_variants(&model_config.model_name, &resolved_api_type);
+    let payload_variants = prioritize_multimodal_payload_variants(
+        payload_variants
+            .into_iter()
+            .map(|variant| MultimodalPayloadVariant {
+                label: variant.label,
+                payload: variant.payload,
+            })
+            .collect(),
+        model_config.image_input_format.as_deref(),
+    )
+    .into_iter()
+    .map(|variant| ImageProbePayloadVariant {
+        label: variant.label,
+        payload: variant.payload,
+    })
+    .collect::<Vec<_>>();
+    let mut rejection_messages = Vec::new();
+    let mut last_status_code = None;
+    let attempted_formats = payload_variants
+        .iter()
+        .map(|variant| variant.label.to_string())
+        .collect::<Vec<_>>();
+
+    for variant in payload_variants {
+        match request_json_via_curl(&endpoint, api_key, &variant.payload).await {
+            Ok(response) => {
+                let status_code = response.status_code;
+                last_status_code = Some(status_code);
+                match parse_model_response(response, &resolved_api_type) {
+                    Ok(_) => {
+                        return Ok(ModelImageProbeResult {
+                            supported: true,
+                            message: format_image_probe_success(&resolved_api_type, variant.label),
+                            status_code: Some(status_code),
+                            working_format: Some(variant.label.to_string()),
+                            attempted_formats: attempted_formats.clone(),
+                        });
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        if is_image_probe_rejection(&message) {
+                            rejection_messages.push(format_image_probe_variant_rejection(
+                                &resolved_api_type,
+                                variant.label,
+                                Some(status_code),
+                                &message,
+                            ));
+                            continue;
+                        }
+
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if is_image_probe_rejection(&message) {
+                    rejection_messages.push(format_image_probe_variant_rejection(
+                        &resolved_api_type,
+                        variant.label,
+                        None,
+                        &message,
+                    ));
+                    continue;
+                }
+
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(ModelImageProbeResult {
+        supported: false,
+        message: format_image_probe_fallback_summary(&resolved_api_type, &rejection_messages),
+        status_code: last_status_code,
+        working_format: None,
+        attempted_formats,
+    })
+}
+
 struct RawModelHttpResponse {
     status_code: u16,
     body: String,
@@ -2310,6 +2756,18 @@ fn build_request_payload(model_name: &str, prompt: &str, api_type: &str, tempera
     })
 }
 
+fn build_image_probe_payload_variants(model_name: &str, api_type: &str) -> Vec<ImageProbePayloadVariant> {
+    let tiny_png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR42mP8z8BQDwAFgwJ/l7MI8QAAAABJRU5ErkJggg==";
+    let prompt = "Briefly confirm whether this image input was received. Reply with plain text only.";
+    build_multimodal_payload_variants(model_name, prompt, tiny_png, api_type)
+        .into_iter()
+        .map(|variant| ImageProbePayloadVariant {
+            label: variant.label,
+            payload: variant.payload,
+        })
+        .collect()
+}
+
 fn parse_model_response(response: RawModelHttpResponse, api_type: &str) -> Result<ChatCompletionResponse, AppError> {
     if api_type == "responses" {
         let parsed: ResponsesApiResponse = serde_json::from_str(&response.body).map_err(|error| {
@@ -2448,10 +2906,14 @@ fn empty_parsed_content() -> ParsedPaperContent {
         full_text: String::new(),
         sections: Vec::<ParsedSection>::new(),
         references: Vec::new(),
+        figures: Vec::new(),
+        tables: Vec::new(),
+        visual_evidence: Vec::new(),
         metadata: crate::models::parsed_content::ParsedMetadata {
             page_count: None,
             parser: "none".into(),
             parsed_at: now_iso(),
+            visual_parsing: None,
         },
     }
 }
@@ -3155,7 +3617,8 @@ mod tests {
         }
 
         let database = Arc::new(Database::open_for_tests(&db_path).expect("live app database should open"));
-        let parse_service = ParseService::new(database.clone());
+        let github_asset_service = Arc::new(crate::services::github_asset_service::GitHubAssetService::new(database.clone()));
+        let parse_service = ParseService::new(database.clone(), github_asset_service);
 
         let (paper_id, original_section_count, parsed_storage_path): (String, i32, String) = database
             .with_connection(|connection| {

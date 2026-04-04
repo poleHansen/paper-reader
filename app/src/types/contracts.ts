@@ -6,7 +6,20 @@ export type UserProfile = {
   readingGoal: string;
   outputLanguage: string;
   experienceLevel: string;
+  githubRepoOwner: string | null;
+  githubRepoName: string | null;
+  githubRepoBranch: string | null;
+  githubRepoPathPrefix: string | null;
+  githubCdnBaseUrl: string | null;
+  githubToken?: string | null;
+  hasGithubToken?: boolean;
   updatedAt?: string;
+};
+
+export type GitHubUploadTestResponse = {
+  publicUrl: string;
+  repositoryPath: string;
+  message: string;
 };
 
 export type SearchPapersRequest = {
@@ -45,6 +58,7 @@ export type ModelConfigRequest = {
   modelName: string;
   apiKey: string;
   apiType: string | null;
+  imageInputFormat: string | null;
   agentType: string | null;
   isDefault: boolean;
 };
@@ -60,6 +74,7 @@ export type ModelConfigResponse = {
   baseUrl: string;
   modelName: string;
   apiType: string | null;
+  imageInputFormat: string | null;
   agentType: string | null;
   isDefault: boolean;
   isRecent: boolean;
@@ -90,6 +105,7 @@ export type TestModelConnectionRequest = {
   modelName: string;
   apiKey: string;
   apiType: string | null;
+  imageInputFormat: string | null;
 };
 
 export type ModelConnectionResult = {
@@ -100,6 +116,17 @@ export type ModelConnectionResult = {
   endpoint: string;
   statusCode: number | null;
   statusText: string;
+  imageInputSupported: boolean;
+  imageInputMessage: string;
+  imageInputWorkingFormat: string | null;
+  imageProbeAttemptedFormats: string[];
+};
+
+export type VisualDiagnostic = {
+  scope: string;
+  code: string;
+  message: string;
+  retryable: boolean;
 };
 
 export type TestModelConnectionResponse = ModelConnectionResult;
@@ -177,6 +204,7 @@ export type ReaderSnapshot = {
   uploadedFileId: string | null;
   mimeType: string | null;
   sizeBytes: number | null;
+  parsedContent?: ParsedContentSummary | null;
   workflowCurrentStep: string;
   nextActionRequired: string | null;
   allowedActions: string[];
@@ -187,10 +215,29 @@ export type ReaderSnapshot = {
   updatedAt: string;
 };
 
+export type ParsedContentSummary = {
+  version: number;
+  storagePath: string;
+  fullTextAvailable: boolean;
+  sectionCount: number;
+  figureCount: number;
+  tableCount: number;
+  visualEnabled: boolean;
+  visualMode: string;
+  visualSummaryCount: number;
+  sampleCaption: string | null;
+  sampleSummary: string | null;
+  visualWarnings: string[];
+  githubUploadDiagnostics: VisualDiagnostic[];
+  visualDiagnostics: VisualDiagnostic[];
+};
+
 export type ContextBatch = {
   batchIndex: number;
   sectionIds: string[];
   sectionTitles: string[];
+  figureIds: string[];
+  tableIds: string[];
   carryInSummaryIds: string[];
   promptBudgetEstimate: number;
 };
@@ -203,7 +250,10 @@ export type ContextPlan = {
   backfillReason: string | null;
   gapCategories: string[];
   selectedSectionIds: string[];
+  selectedFigureIds: string[];
+  selectedTableIds: string[];
   usedHandoffSummaryIds: string[];
+  visualMode: string;
   batchCount: number;
   currentBatchIndex: number;
   truncated: boolean;
@@ -231,10 +281,69 @@ export type AgentRunSummary = {
 };
 
 export type EvidenceItem = {
+  sourceType: string;
+  sourceObjectId: string | null;
   quote: string;
   section: string;
   page: number | null;
   locator: string;
+};
+
+export type ParsedFigure = {
+  id: string;
+  label: string;
+  title: string | null;
+  caption: string;
+  page: number | null;
+  sectionId: string | null;
+  locator: string;
+  imagePath: string;
+  thumbnailPath: string | null;
+  ocrText: string[];
+  summary: string | null;
+  confidence: number | null;
+};
+
+export type ParsedTable = {
+  id: string;
+  label: string;
+  title: string | null;
+  caption: string;
+  page: number | null;
+  sectionId: string | null;
+  locator: string;
+  imagePath: string;
+  thumbnailPath: string | null;
+  ocrText: string[];
+  markdownTable: string | null;
+  summary: string | null;
+  confidence: number | null;
+};
+
+export type ParsedVisualEvidence = {
+  id: string;
+  sourceObjectId: string;
+  sourceObjectType: string;
+  claim: string;
+  supportLevel: string;
+  evidenceText: string;
+  page: number | null;
+  locator: string;
+  confidence: number | null;
+};
+
+export type GetPaperVisualArtifactsRequest = {
+  paperId: string;
+};
+
+export type PaperVisualArtifactsResponse = {
+  paperId: string;
+  version: number;
+  figures: ParsedFigure[];
+  tables: ParsedTable[];
+  visualEvidence: ParsedVisualEvidence[];
+  githubUploadDiagnostics: VisualDiagnostic[];
+  visualDiagnostics: VisualDiagnostic[];
 };
 
 export type HandoffSummary = {

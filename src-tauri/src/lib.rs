@@ -10,7 +10,7 @@ mod utils;
 use std::sync::Arc;
 
 use repositories::database::Database;
-use services::{library_service::LibraryService, model_service::ModelService, paper_service::PaperService, profile_service::ProfileService, runtime_service::RuntimeService};
+use services::{github_asset_service::GitHubAssetService, library_service::LibraryService, model_service::ModelService, paper_service::PaperService, profile_service::ProfileService, runtime_service::RuntimeService};
 use state::AppState;
 use tauri::Manager;
 
@@ -22,10 +22,11 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             let database = Arc::new(Database::new(&handle)?);
+            let github_asset_service = Arc::new(GitHubAssetService::new(database.clone()));
             let state = AppState {
                 profile_service: Arc::new(ProfileService::new(database.clone())),
                 model_service: Arc::new(ModelService::new(database.clone())),
-                paper_service: Arc::new(PaperService::new(database.clone())),
+                paper_service: Arc::new(PaperService::new(database.clone(), github_asset_service)),
                 library_service: Arc::new(LibraryService::new(database.clone())),
                 runtime_service: Arc::new(RuntimeService::new(database.clone())),
             };
@@ -37,6 +38,7 @@ pub fn run() {
             commands::agent_commands::get_agent_run,
             commands::profile_commands::get_profile,
             commands::profile_commands::upsert_profile,
+            commands::profile_commands::test_github_upload,
             commands::model_commands::save_model_config,
             commands::model_commands::update_model_config,
             commands::model_commands::list_model_configs,
@@ -50,8 +52,10 @@ pub fn run() {
             commands::paper_commands::import_paper_from_link,
             commands::paper_commands::pick_pdf_file,
             commands::paper_commands::confirm_paper_metadata,
+            commands::paper_commands::reparse_paper,
             commands::paper_commands::get_paper_parse_status,
             commands::paper_commands::get_reader_snapshot,
+            commands::paper_commands::get_paper_visual_artifacts,
             commands::library_commands::save_to_library,
             commands::library_commands::update_library_item,
             commands::library_commands::list_library_items,

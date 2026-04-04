@@ -1,3 +1,4 @@
+pub mod github_asset_service;
 pub mod library_service;
 pub mod model_service;
 pub mod parse_service;

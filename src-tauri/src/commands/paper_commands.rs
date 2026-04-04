@@ -4,9 +4,10 @@ use tauri_plugin_dialog::DialogExt;
 use crate::{
     errors::AppError,
     models::paper::{
-        ConfirmPaperMetadataRequest, ConfirmPaperMetadataResponse, GetPaperParseStatusRequest, GetReaderSnapshotRequest,
-        ImportPaperFromFileRequest, ImportPaperFromFileResponse, ImportPaperFromLinkRequest, PaperParseStatusResponse,
-        ReaderSnapshotResponse, SearchPapersRequest, SearchPapersResponse,
+        ConfirmPaperMetadataRequest, ConfirmPaperMetadataResponse, GetPaperParseStatusRequest, GetPaperVisualArtifactsRequest,
+        GetReaderSnapshotRequest, ImportPaperFromFileRequest, ImportPaperFromFileResponse, ImportPaperFromLinkRequest,
+        PaperParseStatusResponse, PaperVisualArtifactsResponse, ReaderSnapshotResponse, SearchPapersRequest,
+        SearchPapersResponse,
     },
     state::AppState,
 };
@@ -59,6 +60,15 @@ pub async fn confirm_paper_metadata(
 }
 
 #[tauri::command]
+pub async fn reparse_paper(
+    app: AppHandle,
+    request: GetPaperParseStatusRequest,
+    state: State<'_, AppState>,
+) -> Result<(), AppError> {
+    state.paper_service.reparse_paper(&app, request.paper_id).await
+}
+
+#[tauri::command]
 pub async fn get_paper_parse_status(
     request: GetPaperParseStatusRequest,
     state: State<'_, AppState>,
@@ -72,4 +82,12 @@ pub async fn get_reader_snapshot(
     state: State<'_, AppState>,
 ) -> Result<ReaderSnapshotResponse, AppError> {
     state.paper_service.get_reader_snapshot(request).await
+}
+
+#[tauri::command]
+pub async fn get_paper_visual_artifacts(
+    request: GetPaperVisualArtifactsRequest,
+    state: State<'_, AppState>,
+) -> Result<PaperVisualArtifactsResponse, AppError> {
+    state.paper_service.get_paper_visual_artifacts(request).await
 }

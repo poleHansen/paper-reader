@@ -1,6 +1,10 @@
 use tauri::State;
 
-use crate::{errors::AppError, models::profile::UpsertProfileRequest, state::AppState};
+use crate::{
+    errors::AppError,
+    models::profile::{GitHubUploadTestResponse, UpsertProfileRequest},
+    state::AppState,
+};
 
 #[tauri::command]
 pub async fn get_profile(
@@ -15,4 +19,11 @@ pub async fn upsert_profile(
     state: State<'_, AppState>,
 ) -> Result<crate::models::profile::ProfileResponse, AppError> {
     state.profile_service.upsert_profile(request).await
+}
+
+#[tauri::command]
+pub async fn test_github_upload(
+    state: State<'_, AppState>,
+) -> Result<GitHubUploadTestResponse, AppError> {
+    state.profile_service.test_github_upload().await
 }

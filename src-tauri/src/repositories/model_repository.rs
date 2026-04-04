@@ -37,8 +37,8 @@ impl ModelRepository {
                 connection.execute("UPDATE model_configs SET is_default = 0 WHERE is_default = 1", [])?;
             }
             connection.execute(
-                "INSERT INTO model_configs (id, display_name, provider, base_url, model_name, api_type, api_key_fallback, agent_type, is_default, is_recent, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10)",
+                "INSERT INTO model_configs (id, display_name, provider, base_url, model_name, api_type, image_input_format, api_key_fallback, agent_type, is_default, is_recent, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?11)",
                 rusqlite::params![
                     id,
                     request.display_name,
@@ -46,6 +46,7 @@ impl ModelRepository {
                     request.base_url,
                     request.model_name,
                     request.api_type,
+                    request.image_input_format,
                     api_key_fallback,
                     request.agent_type,
                     i64::from(request.is_default),
@@ -70,6 +71,7 @@ impl ModelRepository {
             base_url: request.base_url.clone(),
             model_name: request.model_name.clone(),
             api_type: request.api_type.clone(),
+            image_input_format: request.image_input_format.clone(),
             agent_type: request.agent_type.clone(),
             is_default: request.is_default,
             is_recent: true,
@@ -81,7 +83,7 @@ impl ModelRepository {
     pub fn list(&self) -> Result<ModelConfigListResponse, AppError> {
         self.database.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT id, display_name, provider, base_url, model_name, api_type, agent_type, is_default, is_recent, api_key_fallback, updated_at
+                "SELECT id, display_name, provider, base_url, model_name, api_type, image_input_format, agent_type, is_default, is_recent, api_key_fallback, updated_at
                  FROM model_configs
                  ORDER BY is_recent DESC, updated_at DESC",
             )?;
@@ -93,12 +95,13 @@ impl ModelRepository {
                     base_url: row.get::<_, String>(3)?,
                     model_name: row.get::<_, String>(4)?,
                     api_type: row.get::<_, Option<String>>(5)?,
-                    agent_type: row.get::<_, Option<String>>(6)?,
-                    is_default: row.get::<_, i64>(7)? == 1,
-                    is_recent: row.get::<_, i64>(8)? == 1,
-                    has_credential: row.get::<_, Option<String>>(9)?.is_some()
+                    image_input_format: row.get::<_, Option<String>>(6)?,
+                    agent_type: row.get::<_, Option<String>>(7)?,
+                    is_default: row.get::<_, i64>(8)? == 1,
+                    is_recent: row.get::<_, i64>(9)? == 1,
+                    has_credential: row.get::<_, Option<String>>(10)?.is_some()
                         || Entry::new("paper-reader", &row.get::<_, String>(0)?).ok().and_then(|entry| entry.get_password().ok()).is_some(),
-                    updated_at: row.get::<_, String>(10)?,
+                    updated_at: row.get::<_, String>(11)?,
                 })
             })?;
 
@@ -132,10 +135,11 @@ impl ModelRepository {
                      base_url = ?4,
                      model_name = ?5,
                      api_type = ?6,
-                     api_key_fallback = COALESCE(?7, api_key_fallback),
-                     agent_type = ?8,
-                     is_default = ?9,
-                     updated_at = ?10
+                     image_input_format = ?7,
+                     api_key_fallback = COALESCE(?8, api_key_fallback),
+                     agent_type = ?9,
+                     is_default = ?10,
+                     updated_at = ?11
                  WHERE id = ?1",
                 rusqlite::params![
                     request.id,
@@ -144,6 +148,7 @@ impl ModelRepository {
                     request.base_url,
                     request.model_name,
                     request.api_type,
+                    request.image_input_format,
                     api_key_fallback,
                     request.agent_type,
                     i64::from(request.is_default),
@@ -219,7 +224,7 @@ impl ModelRepository {
         self.database.with_connection(|connection| {
             connection
                 .query_row(
-                    "SELECT id, display_name, provider, base_url, model_name, api_type, agent_type, is_default, is_recent, api_key_fallback, updated_at
+                    "SELECT id, display_name, provider, base_url, model_name, api_type, image_input_format, agent_type, is_default, is_recent, api_key_fallback, updated_at
                      FROM model_configs
                      WHERE id = ?1",
                     rusqlite::params![id],
@@ -228,7 +233,7 @@ impl ModelRepository {
                         let api_key = Entry::new("paper-reader", &model_id)
                             .ok()
                             .and_then(|entry| entry.get_password().ok())
-                            .or(row.get::<_, Option<String>>(9)?)
+                            .or(row.get::<_, Option<String>>(10)?)
                             .unwrap_or_default();
                         Ok(ModelConfigDetailResponse {
                             id: model_id,
@@ -238,11 +243,12 @@ impl ModelRepository {
                             model_name: row.get::<_, String>(4)?,
                             api_key: api_key.clone(),
                             api_type: row.get::<_, Option<String>>(5)?,
-                            agent_type: row.get::<_, Option<String>>(6)?,
-                            is_default: row.get::<_, i64>(7)? == 1,
-                            is_recent: row.get::<_, i64>(8)? == 1,
+                            image_input_format: row.get::<_, Option<String>>(6)?,
+                            agent_type: row.get::<_, Option<String>>(7)?,
+                            is_default: row.get::<_, i64>(8)? == 1,
+                            is_recent: row.get::<_, i64>(9)? == 1,
                             has_credential: !api_key.is_empty(),
-                            updated_at: row.get::<_, String>(10)?,
+                            updated_at: row.get::<_, String>(11)?,
                         })
                     },
                 )
@@ -257,13 +263,13 @@ impl ModelRepository {
         self.database.with_connection(|connection| {
             connection
                 .query_row(
-                    "SELECT id, display_name, provider, base_url, model_name, api_type, agent_type, is_default, is_recent, api_key_fallback, updated_at
+                    "SELECT id, display_name, provider, base_url, model_name, api_type, image_input_format, agent_type, is_default, is_recent, api_key_fallback, updated_at
                      FROM model_configs
                      WHERE id = ?1",
                     rusqlite::params![id],
                     |row| {
                         let model_id = row.get::<_, String>(0)?;
-                        let has_credential = row.get::<_, Option<String>>(9)?.is_some()
+                        let has_credential = row.get::<_, Option<String>>(10)?.is_some()
                             || Entry::new("paper-reader", &model_id).ok().and_then(|entry| entry.get_password().ok()).is_some();
                         Ok(ModelConfigResponse {
                             id: model_id,
@@ -272,11 +278,12 @@ impl ModelRepository {
                             base_url: row.get::<_, String>(3)?,
                             model_name: row.get::<_, String>(4)?,
                             api_type: row.get::<_, Option<String>>(5)?,
-                            agent_type: row.get::<_, Option<String>>(6)?,
-                            is_default: row.get::<_, i64>(7)? == 1,
-                            is_recent: row.get::<_, i64>(8)? == 1,
+                            image_input_format: row.get::<_, Option<String>>(6)?,
+                            agent_type: row.get::<_, Option<String>>(7)?,
+                            is_default: row.get::<_, i64>(8)? == 1,
+                            is_recent: row.get::<_, i64>(9)? == 1,
                             has_credential,
-                            updated_at: row.get::<_, String>(10)?,
+                            updated_at: row.get::<_, String>(11)?,
                         })
                     },
                 )
@@ -291,7 +298,7 @@ impl ModelRepository {
         self.database.with_connection(|connection| {
             connection
                 .query_row(
-                    "SELECT id, display_name, provider, base_url, model_name, api_type, agent_type, is_default, is_recent, api_key_fallback, updated_at
+                    "SELECT id, display_name, provider, base_url, model_name, api_type, image_input_format, agent_type, is_default, is_recent, api_key_fallback, updated_at
                      FROM model_configs
                      WHERE is_recent = 1
                      ORDER BY updated_at DESC
@@ -299,7 +306,7 @@ impl ModelRepository {
                     [],
                     |row| {
                         let id = row.get::<_, String>(0)?;
-                        let has_credential = row.get::<_, Option<String>>(9)?.is_some()
+                        let has_credential = row.get::<_, Option<String>>(10)?.is_some()
                             || Entry::new("paper-reader", &id).ok().and_then(|entry| entry.get_password().ok()).is_some();
                         Ok(ModelConfigResponse {
                             id,
@@ -308,11 +315,12 @@ impl ModelRepository {
                             base_url: row.get::<_, String>(3)?,
                             model_name: row.get::<_, String>(4)?,
                             api_type: row.get::<_, Option<String>>(5)?,
-                            agent_type: row.get::<_, Option<String>>(6)?,
-                            is_default: row.get::<_, i64>(7)? == 1,
-                            is_recent: row.get::<_, i64>(8)? == 1,
+                            image_input_format: row.get::<_, Option<String>>(6)?,
+                            agent_type: row.get::<_, Option<String>>(7)?,
+                            is_default: row.get::<_, i64>(8)? == 1,
+                            is_recent: row.get::<_, i64>(9)? == 1,
                             has_credential,
-                            updated_at: row.get::<_, String>(10)?,
+                            updated_at: row.get::<_, String>(11)?,
                         })
                     },
                 )
@@ -340,13 +348,13 @@ impl ModelRepository {
 
             connection
                 .query_row(
-                    "SELECT id, display_name, provider, base_url, model_name, api_type, agent_type, is_default, is_recent, api_key_fallback, updated_at
+                    "SELECT id, display_name, provider, base_url, model_name, api_type, image_input_format, agent_type, is_default, is_recent, api_key_fallback, updated_at
                      FROM model_configs
                      WHERE id = ?1",
                     rusqlite::params![id],
                     |row| {
                         let model_id = row.get::<_, String>(0)?;
-                        let has_credential = row.get::<_, Option<String>>(9)?.is_some()
+                        let has_credential = row.get::<_, Option<String>>(10)?.is_some()
                             || Entry::new("paper-reader", &model_id).ok().and_then(|entry| entry.get_password().ok()).is_some();
                         Ok(ModelConfigResponse {
                             id: model_id,
@@ -355,11 +363,12 @@ impl ModelRepository {
                             base_url: row.get::<_, String>(3)?,
                             model_name: row.get::<_, String>(4)?,
                             api_type: row.get::<_, Option<String>>(5)?,
-                            agent_type: row.get::<_, Option<String>>(6)?,
-                            is_default: row.get::<_, i64>(7)? == 1,
-                            is_recent: row.get::<_, i64>(8)? == 1,
+                            image_input_format: row.get::<_, Option<String>>(6)?,
+                            agent_type: row.get::<_, Option<String>>(7)?,
+                            is_default: row.get::<_, i64>(8)? == 1,
+                            is_recent: row.get::<_, i64>(9)? == 1,
                             has_credential,
-                            updated_at: row.get::<_, String>(10)?,
+                            updated_at: row.get::<_, String>(11)?,
                         })
                     },
                 )
@@ -371,7 +380,7 @@ impl ModelRepository {
         self.database.with_connection(|connection| {
             let selected = connection
                 .query_row(
-                    "SELECT id, display_name, provider, base_url, model_name, api_type, api_key_fallback, agent_type, is_default
+                    "SELECT id, display_name, provider, base_url, model_name, api_type, api_key_fallback, agent_type, is_default, image_input_format
                      FROM model_configs
                      WHERE agent_type = ?1
                      ORDER BY updated_at DESC
@@ -388,6 +397,7 @@ impl ModelRepository {
                             row.get::<_, Option<String>>(6)?,
                             row.get::<_, Option<String>>(7)?,
                             row.get::<_, i64>(8)?,
+                            row.get::<_, Option<String>>(9)?,
                         ))
                     },
                 )
@@ -395,7 +405,7 @@ impl ModelRepository {
                 .or(
                     connection
                         .query_row(
-                            "SELECT id, display_name, provider, base_url, model_name, api_type, api_key_fallback, agent_type, is_default
+                            "SELECT id, display_name, provider, base_url, model_name, api_type, api_key_fallback, agent_type, is_default, image_input_format
                              FROM model_configs
                              WHERE is_recent = 1 OR is_default = 1
                              ORDER BY is_recent DESC, updated_at DESC
@@ -412,6 +422,7 @@ impl ModelRepository {
                                     row.get::<_, Option<String>>(6)?,
                                     row.get::<_, Option<String>>(7)?,
                                     row.get::<_, i64>(8)?,
+                                    row.get::<_, Option<String>>(9)?,
                                 ))
                             },
                         )
@@ -432,6 +443,7 @@ impl ModelRepository {
                 api_type: selected.5,
                 agent_type: selected.7,
                 is_default: selected.8 == 1,
+                image_input_format: selected.9,
                 api_key,
             })
         })

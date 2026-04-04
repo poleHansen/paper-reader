@@ -11,7 +11,14 @@ use uuid::Uuid;
 
 use crate::{
     errors::AppError,
-    models::paper::{ConfirmPaperMetadataRequest, ConfirmPaperMetadataResponse, ImportPaperFromFileResponse, PaperParseStatusResponse, ReaderSnapshotResponse},
+    models::{
+        paper::{
+            ConfirmPaperMetadataRequest, ConfirmPaperMetadataResponse, ImportPaperFromFileResponse,
+            PaperParseStatusResponse, PaperVisualArtifactsResponse, ParsedContentSummary,
+            ReaderSnapshotResponse,
+        },
+        parsed_content::ParsedPaperContent,
+    },
     repositories::{database::Database, runtime_repository::RuntimeRepository},
     utils::time::now_iso,
 };
@@ -240,6 +247,31 @@ impl PaperRepository {
         })
     }
 
+    pub fn reset_parse_status(&self, paper_id: &str) -> Result<(), AppError> {
+        let now = now_iso();
+        self.database.with_connection(|connection| {
+            let updated = connection.execute(
+                "UPDATE uploaded_files SET parse_status = 'pending', parse_error_code = NULL, parse_error_message = NULL WHERE paper_id = ?1",
+                rusqlite::params![paper_id],
+            )?;
+
+            if updated == 0 {
+                return Err(AppError::NotFound("paper not found".into()));
+            }
+
+            connection.execute(
+                "INSERT INTO paper_parse_tasks (paper_id, status, stage, progress, attempt_count, last_error_code, last_error_message, retryable, updated_at)
+                 VALUES (?1, 'pending', 'queued', 0, 0, NULL, NULL, NULL, ?2)
+                 ON CONFLICT(paper_id) DO UPDATE SET status = excluded.status, stage = excluded.stage, progress = excluded.progress, attempt_count = excluded.attempt_count, last_error_code = NULL, last_error_message = NULL, retryable = NULL, updated_at = excluded.updated_at",
+                rusqlite::params![paper_id, now],
+            )?;
+            Ok(())
+        })?;
+
+        RuntimeRepository::new(self.database.clone()).seed_workflow_for_paper(paper_id, "pending")?;
+        Ok(())
+    }
+
     pub fn get_parse_status(&self, paper_id: &str) -> Result<PaperParseStatusResponse, AppError> {
         self.database.with_connection(|connection| {
             connection
@@ -300,10 +332,25 @@ impl PaperRepository {
                         li.status,
                         li.tags_json,
                         li.starred,
+                                ppa.version,
+                                ppa.storage_path,
+                                ppa.full_text_available,
+                                ppa.section_count,
+                                COALESCE(ppa.figure_count, 0),
+                                COALESCE(ppa.table_count, 0),
+                                COALESCE(ppa.visual_enabled, 0),
+                                COALESCE(ppa.visual_mode, 'disabled'),
+                                COALESCE(ppa.visual_summary_count, 0),
+                                pva.sample_caption,
+                                pva.sample_summary,
+                                pva.warnings_json,
+                                pva.diagnostics_json,
                         p.updated_at
                      FROM papers p
                      LEFT JOIN uploaded_files uf ON uf.paper_id = p.id
                             LEFT JOIN paper_parse_tasks pt ON pt.paper_id = p.id
+                            LEFT JOIN parsed_paper_artifacts ppa ON ppa.paper_id = p.id
+                            LEFT JOIN parsed_visual_artifacts pva ON pva.paper_id = p.id
                      LEFT JOIN library_items li ON li.paper_id = p.id
                      WHERE p.id = ?1
                      ORDER BY uf.created_at DESC
@@ -312,6 +359,35 @@ impl PaperRepository {
                     |row| {
                         let authors_json: String = row.get(3)?;
                         let tags_json: Option<String> = row.get(18)?;
+                        let warnings_json: Option<String> = row.get(31)?;
+                        let diagnostics_json: Option<String> = row.get(32)?;
+                        let parsed_content = if let Some(version) = row.get::<_, Option<i32>>(20)? {
+                            let storage_path = row.get::<_, String>(21).unwrap_or_default();
+                            Some(ParsedContentSummary {
+                                version,
+                                storage_path: storage_path.clone(),
+                                full_text_available: row.get::<_, Option<bool>>(22).unwrap_or(Some(false)).unwrap_or(false),
+                                section_count: row.get::<_, Option<i32>>(23).unwrap_or(Some(0)).unwrap_or(0),
+                                figure_count: row.get::<_, Option<i32>>(24).unwrap_or(Some(0)).unwrap_or(0),
+                                table_count: row.get::<_, Option<i32>>(25).unwrap_or(Some(0)).unwrap_or(0),
+                                visual_enabled: row.get::<_, Option<bool>>(26).unwrap_or(Some(false)).unwrap_or(false),
+                                visual_mode: row.get::<_, Option<String>>(27).unwrap_or(Some("disabled".into())).unwrap_or_else(|| "disabled".into()),
+                                visual_summary_count: row.get::<_, Option<i32>>(28).unwrap_or(Some(0)).unwrap_or(0),
+                                sample_caption: row.get(29)?,
+                                sample_summary: row.get(30)?,
+                                visual_warnings: warnings_json
+                                    .as_deref()
+                                    .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+                                    .unwrap_or_default(),
+                                github_upload_diagnostics: load_github_upload_diagnostics(&storage_path),
+                                visual_diagnostics: diagnostics_json
+                                    .as_deref()
+                                    .and_then(|value| serde_json::from_str::<Vec<crate::models::parsed_content::VisualDiagnostic>>(value).ok())
+                                    .unwrap_or_else(|| load_visual_diagnostics(&storage_path)),
+                            })
+                        } else {
+                            None
+                        };
                         Ok(ReaderSnapshotResponse {
                             paper_id: row.get(0)?,
                             title: row.get(1)?,
@@ -325,6 +401,7 @@ impl PaperRepository {
                             uploaded_file_id: row.get(9)?,
                             mime_type: row.get(10)?,
                             size_bytes: row.get(11)?,
+                            parsed_content,
                             parse_status: row.get::<_, Option<String>>(12)?.unwrap_or_else(|| "pending".into()),
                             parse_progress: row.get::<_, Option<i32>>(15)?.unwrap_or(0),
                             parse_error_code: row.get(13)?,
@@ -343,7 +420,7 @@ impl PaperRepository {
                             latest_handoff_summary_ids: Vec::new(),
                             latest_agent_runs: Vec::new(),
                             active_run: None,
-                            updated_at: row.get(20)?,
+                            updated_at: row.get(33)?,
                         })
                     },
                 )
@@ -362,4 +439,74 @@ impl PaperRepository {
             Ok(snapshot)
         })
     }
+
+    pub fn get_paper_visual_artifacts(&self, paper_id: &str) -> Result<PaperVisualArtifactsResponse, AppError> {
+        let storage_path = self.database.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT storage_path, version FROM parsed_paper_artifacts WHERE paper_id = ?1",
+                    rusqlite::params![paper_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?)),
+                )
+                .optional()
+                .map_err(AppError::from)
+        })?;
+
+        let (storage_path, version) = storage_path.ok_or_else(|| AppError::NotFound("parsed paper artifact not found".into()))?;
+        let content = fs::read_to_string(&storage_path)
+            .map_err(|error| AppError::NotFound(format!("parsed content file unavailable: {error}")))?;
+        let parsed: ParsedPaperContent = serde_json::from_str(&content)
+            .map_err(|error| AppError::Internal(format!("parsed content JSON invalid: {error}")))?;
+
+        Ok(PaperVisualArtifactsResponse {
+            paper_id: paper_id.to_string(),
+            version,
+            figures: parsed.figures,
+            tables: parsed.tables,
+            visual_evidence: parsed.visual_evidence,
+            github_upload_diagnostics: parsed
+                .metadata
+                .visual_parsing
+                .as_ref()
+                .map(|metadata| metadata.github_upload_diagnostics.clone())
+                .unwrap_or_default(),
+            visual_diagnostics: parsed
+                .metadata
+                .visual_parsing
+                .map(|metadata| metadata.diagnostics)
+                .unwrap_or_default(),
+        })
+    }
+}
+
+fn load_github_upload_diagnostics(storage_path: &str) -> Vec<crate::models::parsed_content::VisualDiagnostic> {
+    if storage_path.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let content = match fs::read_to_string(storage_path) {
+        Ok(content) => content,
+        Err(_) => return Vec::new(),
+    };
+
+    serde_json::from_str::<crate::models::parsed_content::ParsedPaperContent>(&content)
+        .ok()
+        .and_then(|parsed| parsed.metadata.visual_parsing.map(|metadata| metadata.github_upload_diagnostics))
+        .unwrap_or_default()
+}
+
+fn load_visual_diagnostics(storage_path: &str) -> Vec<crate::models::parsed_content::VisualDiagnostic> {
+    if storage_path.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let content = match fs::read_to_string(storage_path) {
+        Ok(content) => content,
+        Err(_) => return Vec::new(),
+    };
+
+    serde_json::from_str::<crate::models::parsed_content::ParsedPaperContent>(&content)
+        .ok()
+        .and_then(|parsed| parsed.metadata.visual_parsing.map(|metadata| metadata.diagnostics))
+        .unwrap_or_default()
 }

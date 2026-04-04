@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { convertFileSrc } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
   confirmPaperMetadata,
@@ -7,6 +8,7 @@ import {
   getModelConfigDetail,
   getRecentModelConfig,
   getPaperParseStatus,
+  getPaperVisualArtifacts,
   getProfile,
   getReaderSnapshot,
   importPaperFromFile,
@@ -14,9 +16,11 @@ import {
   listModelConfigs,
   listLibraryItems,
   pickPdfFile,
+  reparsePaper,
   runAgent,
   saveModelConfig,
   selectModelConfig,
+  testGitHubUpload,
   updateModelConfig,
   updateLibraryItem,
   searchPapers,
@@ -34,14 +38,19 @@ import type {
   ModelConfigResponse,
   ModelConfigRequest,
   PaperSearchResult,
+  PaperVisualArtifactsResponse,
+  ParsedFigure,
+  ParsedTable,
   ReaderSnapshot,
   UserProfile,
+  VisualDiagnostic,
 } from '../types/contracts';
 
 type View = 'dashboard' | 'onboarding' | 'search' | 'upload' | 'reader' | 'library' | 'model';
 
 const navigationItems: Array<{ view: View; label: string }> = [
   { view: 'dashboard', label: 'Dashboard' },
+  { view: 'onboarding', label: 'User Profile' },
   { view: 'search', label: 'Search' },
   { view: 'upload', label: 'Upload' },
   { view: 'reader', label: 'Reader' },
@@ -56,6 +65,13 @@ const defaultProfile: UserProfile = {
   readingGoal: 'deep_understanding',
   outputLanguage: 'zh-CN',
   experienceLevel: 'intermediate',
+  githubRepoOwner: null,
+  githubRepoName: null,
+  githubRepoBranch: null,
+  githubRepoPathPrefix: null,
+  githubCdnBaseUrl: null,
+  githubToken: null,
+  hasGithubToken: false,
 };
 
 export function App() {
@@ -76,6 +92,7 @@ export function App() {
     modelName: 'gpt-4.1-mini',
     apiKey: '',
     apiType: 'chat_completions',
+    imageInputFormat: null,
     agentType: null,
     isDefault: true,
   });
@@ -83,6 +100,7 @@ export function App() {
   const [paperUrl, setPaperUrl] = useState('');
   const [selectedPaperId, setSelectedPaperId] = useState<string | null>(null);
   const [readerSnapshot, setReaderSnapshot] = useState<ReaderSnapshot | null>(null);
+  const [visualArtifacts, setVisualArtifacts] = useState<PaperVisualArtifactsResponse | null>(null);
   const [hasProfile, setHasProfile] = useState(false);
   const [libraryFilterStatus, setLibraryFilterStatus] = useState('');
   const [libraryKeyword, setLibraryKeyword] = useState('');
@@ -97,6 +115,14 @@ export function App() {
   const [activeRun, setActiveRun] = useState<AgentRunDetail | null>(null);
   const libraryHighlights = libraryItems.slice(0, 3);
   const workflowSteps = buildWorkflowSteps(readerSnapshot?.workflowCurrentStep ?? null);
+  const effectiveGithubBranch = profile.githubRepoBranch?.trim() || 'main';
+  const githubHostingReady = Boolean(
+    profile.githubRepoOwner?.trim()
+    && profile.githubRepoName?.trim()
+    && profile.hasGithubToken,
+  );
+  const modelNeedsGithubHosting = modelDraft.imageInputFormat === 'url_required'
+    || modelStatus?.imageInputWorkingFormat === 'url_required';
 
   useEffect(() => {
     void loadProfile();
@@ -146,7 +172,7 @@ export function App() {
   async function loadProfile() {
     try {
       const saved = await getProfile();
-      setProfile(saved);
+      setProfile({ ...saved, githubToken: null });
       setHasProfile(true);
     } catch (error) {
       if (isNotFoundError(error)) {
@@ -181,10 +207,28 @@ export function App() {
   async function handleSaveProfile() {
     try {
       const saved = await upsertProfile(profile);
-      setProfile(saved);
+      setProfile({ ...saved, githubToken: null });
       setHasProfile(true);
       setActiveView('search');
       setStatusText('Profile saved');
+    } catch (error) {
+      setStatusText(formatError(error));
+    }
+  }
+
+  async function handleTestGitHubUpload() {
+    if (!profile.githubRepoOwner?.trim() || !profile.githubRepoName?.trim()) {
+      setStatusText('GitHub upload test requires repo owner and repo name in User Profile');
+      return;
+    }
+    if (!profile.hasGithubToken && !profile.githubToken?.trim()) {
+      setStatusText('GitHub upload test requires a saved GitHub token. Enter a token and click Save profile first.');
+      return;
+    }
+
+    try {
+      const result = await testGitHubUpload();
+      setStatusText(`GitHub upload test succeeded: ${result.repositoryPath} -> ${result.publicUrl}`);
     } catch (error) {
       setStatusText(formatError(error));
     }
@@ -233,6 +277,7 @@ export function App() {
       modelName: model.modelName,
       apiKey: model.apiKey,
       apiType: model.apiType,
+      imageInputFormat: model.imageInputFormat,
       agentType: model.agentType,
       isDefault: model.isDefault,
     });
@@ -250,6 +295,7 @@ export function App() {
         modelName: 'gpt-4.1-mini',
         apiKey: '',
         apiType: 'chat_completions',
+        imageInputFormat: null,
         agentType: null,
         isDefault: true,
       });
@@ -299,9 +345,19 @@ export function App() {
         modelName: modelDraft.modelName,
         apiKey: modelDraft.apiKey,
         apiType: modelDraft.apiType,
+        imageInputFormat: modelDraft.imageInputFormat,
       });
+      setModelDraft((current) => ({
+        ...current,
+        apiType: result.apiType,
+        imageInputFormat: result.imageInputWorkingFormat,
+      }));
       setModelStatus(result);
-      setStatusText(result.connected ? 'Model request succeeded' : result.statusText);
+      setStatusText(
+        result.connected
+          ? `Model request succeeded. ${result.imageInputMessage}`
+          : result.statusText,
+      );
     } catch (error) {
       setStatusText(formatError(error));
     }
@@ -364,14 +420,16 @@ export function App() {
     try {
       const snapshot = await getReaderSnapshot({ paperId });
       setReaderSnapshot(snapshot);
-      if (snapshot.activeRun) {
-        setStatusText(`${snapshot.activeRun.agentType} is running, batch ${snapshot.activeRun.currentBatchIndex}/${snapshot.activeRun.currentBatchCount}`);
-      }
-      if (activeRun && activeRun.paperId !== paperId) {
-        setActiveRun(null);
+
+      if (snapshot.parsedContent) {
+        const artifacts = await getPaperVisualArtifacts({ paperId });
+        setVisualArtifacts(artifacts);
+      } else {
+        setVisualArtifacts(null);
       }
     } catch (error) {
       setStatusText(formatError(error));
+      setVisualArtifacts(null);
     }
   }
 
@@ -391,6 +449,21 @@ export function App() {
     try {
       const status = await getPaperParseStatus({ paperId: selectedPaperId });
       setStatusText(`Parse status: ${status.parseStatus} (${status.stage})`);
+      await loadReaderSnapshot(selectedPaperId);
+    } catch (error) {
+      setStatusText(formatError(error));
+    }
+  }
+
+  async function handleReparsePaper() {
+    if (!selectedPaperId) {
+      setStatusText('Open a paper before starting reparse');
+      return;
+    }
+
+    try {
+      await reparsePaper({ paperId: selectedPaperId });
+      setStatusText('Reparse started. This pass will regenerate visual assets and upload GitHub-hosted images when visual parsing runs.');
       await loadReaderSnapshot(selectedPaperId);
     } catch (error) {
       setStatusText(formatError(error));
@@ -613,8 +686,30 @@ export function App() {
               <input value={profile.researchField} onChange={(event) => setProfile({ ...profile, researchField: event.target.value })} placeholder="research field" />
               <input value={profile.focusTopic ?? ''} onChange={(event) => setProfile({ ...profile, focusTopic: event.target.value })} placeholder="focus topic" />
               <input value={profile.readingGoal} onChange={(event) => setProfile({ ...profile, readingGoal: event.target.value })} placeholder="reading goal" />
+              <input value={profile.outputLanguage} onChange={(event) => setProfile({ ...profile, outputLanguage: event.target.value })} placeholder="output language" />
+              <input value={profile.experienceLevel} onChange={(event) => setProfile({ ...profile, experienceLevel: event.target.value })} placeholder="experience level" />
+              <input value={profile.githubRepoOwner ?? ''} onChange={(event) => setProfile({ ...profile, githubRepoOwner: event.target.value || null })} placeholder="github repo owner" />
+              <input value={profile.githubRepoName ?? ''} onChange={(event) => setProfile({ ...profile, githubRepoName: event.target.value || null })} placeholder="github repo name" />
+              <input value={profile.githubRepoBranch ?? ''} onChange={(event) => setProfile({ ...profile, githubRepoBranch: event.target.value || null })} placeholder="github branch" />
+              <input value={profile.githubRepoPathPrefix ?? ''} onChange={(event) => setProfile({ ...profile, githubRepoPathPrefix: event.target.value || null })} placeholder="github path prefix (optional)" />
+              <input value={profile.githubCdnBaseUrl ?? ''} onChange={(event) => setProfile({ ...profile, githubCdnBaseUrl: event.target.value || null })} placeholder="github cdn/raw base url (optional)" />
+              <input type="password" value={profile.githubToken ?? ''} onChange={(event) => setProfile({ ...profile, githubToken: event.target.value || null })} placeholder={profile.hasGithubToken ? 'github token already saved; enter to replace' : 'github token'} />
             </div>
-            <div className="row rowEnd">
+            <div className={githubHostingReady ? 'noticeCard noticeCardSuccess' : 'noticeCard'}>
+              <strong>GitHub image hosting</strong>
+              <span>
+                {githubHostingReady
+                  ? `Ready: ${profile.githubRepoOwner}/${profile.githubRepoName}@${effectiveGithubBranch}`
+                  : 'Not fully configured yet. Public image URL fallback will stay unavailable until owner, repo, and token are all set. Branch defaults to main when left blank.'}
+              </span>
+              {!profile.githubRepoBranch?.trim() && githubHostingReady ? <span>Branch default: main</span> : null}
+              {profile.githubRepoPathPrefix ? <span>Path prefix: {profile.githubRepoPathPrefix}</span> : null}
+              {profile.githubCdnBaseUrl ? <span>CDN base: {profile.githubCdnBaseUrl}</span> : null}
+            </div>
+            <div className="row rowEnd rowWrap">
+              <button className="secondaryButton" onClick={() => void handleTestGitHubUpload()}>
+                Test GitHub upload
+              </button>
               <button onClick={() => void handleSaveProfile()}>Save profile</button>
             </div>
           </section>
@@ -716,7 +811,10 @@ export function App() {
                 <h2>Paper workspace</h2>
                 <p className="muted">Current implementation is a minimal snapshot view. It now behaves like a real destination in the flow.</p>
               </div>
-              <button onClick={() => void handleRefreshParseStatus()} disabled={!selectedPaperId}>Refresh status</button>
+              <div className="row rowWrap">
+                <button className="secondaryButton" onClick={() => void handleReparsePaper()} disabled={!selectedPaperId}>Reparse paper</button>
+                <button onClick={() => void handleRefreshParseStatus()} disabled={!selectedPaperId}>Refresh status</button>
+              </div>
             </div>
             {readerSnapshot ? (
               <div className="readerGrid">
@@ -755,6 +853,123 @@ export function App() {
                     {readerSnapshot.allowedActions.includes('run_summary') ? <button onClick={() => void handleRunAgent('summary')}>Run summary</button> : null}
                   </div>
                   {readerSnapshot.parseErrorMessage ? <span>Error: {readerSnapshot.parseErrorMessage}</span> : null}
+                </section>
+
+                <section className="readerPanel readerPanelScrollable">
+                  <span className="eyebrow">Visual artifacts</span>
+                  <strong>
+                    Figures {readerSnapshot.parsedContent?.figureCount ?? 0} · Tables {readerSnapshot.parsedContent?.tableCount ?? 0}
+                  </strong>
+                  <span>Visual mode: {readerSnapshot.parsedContent?.visualMode ?? 'disabled'}</span>
+                  <span>
+                    Visual parsing: {readerSnapshot.parsedContent?.visualMode === 'multimodal'
+                      ? 'multimodal interpreted'
+                      : readerSnapshot.parsedContent?.visualEnabled
+                        ? 'fallback extraction'
+                        : 'disabled'}
+                  </span>
+                  <span>Summaries: {readerSnapshot.parsedContent?.visualSummaryCount ?? 0}</span>
+                  {readerSnapshot.parsedContent?.sampleCaption ? (
+                    <div className="visualPreviewCard">
+                      <span className="detailLabel">Sample caption</span>
+                      <strong>{readerSnapshot.parsedContent.sampleCaption}</strong>
+                      <span>{readerSnapshot.parsedContent.sampleSummary ?? 'No visual summary generated yet.'}</span>
+                    </div>
+                  ) : null}
+                  <span>Warnings: {readerSnapshot.parsedContent?.visualWarnings.join(' | ') || 'none'}</span>
+                  {renderGitHubUploadDiagnostics(readerSnapshot.parsedContent?.githubUploadDiagnostics ?? [])}
+                  {renderVisualDiagnostics(readerSnapshot.parsedContent?.visualDiagnostics ?? [])}
+                  {visualArtifacts && (visualArtifacts.figures.length > 0 || visualArtifacts.tables.length > 0 || visualArtifacts.visualEvidence.length > 0) ? (
+                    <div className="detailGroup">
+                      {renderGitHubUploadDiagnostics(visualArtifacts.githubUploadDiagnostics)}
+                      {renderVisualDiagnostics(visualArtifacts.visualDiagnostics)}
+                      {visualArtifacts.figures.length > 0 ? (
+                        <div className="detailGroup">
+                          <span className="detailLabel">Figures</span>
+                          <div className="artifactList">
+                            {visualArtifacts.figures.map((figure) => (
+                              <article className="artifactCard" key={figure.id}>
+                                {renderVisualPreview(figure)}
+                                <div className="artifactContent">
+                                  <div className="artifactHeader">
+                                    <strong>{figure.label || figure.id}</strong>
+                                    <span>{formatArtifactMeta(figure.page, figure.locator, figure.confidence)}</span>
+                                  </div>
+                                  {figure.title ? <span className="artifactTitle">{figure.title}</span> : null}
+                                  <p>{figure.caption}</p>
+                                  <div className="detailGroup">
+                                    <span className="detailLabel">Model reading</span>
+                                    <span>{figureSummaryMode(visualArtifacts, figure.id)}</span>
+                                    <span>{displayVisualSummary(visualArtifacts, figure.id, figure.summary)}</span>
+                                  </div>
+                                  {figure.ocrText.length > 0 ? (
+                                    <details>
+                                      <summary>OCR text</summary>
+                                      <pre>{figure.ocrText.join('\n')}</pre>
+                                    </details>
+                                  ) : null}
+                                </div>
+                              </article>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                      {visualArtifacts.tables.length > 0 ? (
+                        <div className="detailGroup">
+                          <span className="detailLabel">Tables</span>
+                          <div className="artifactList">
+                            {visualArtifacts.tables.map((table) => (
+                              <article className="artifactCard" key={table.id}>
+                                {renderVisualPreview(table)}
+                                <div className="artifactContent">
+                                  <div className="artifactHeader">
+                                    <strong>{table.label || table.id}</strong>
+                                    <span>{formatArtifactMeta(table.page, table.locator, table.confidence)}</span>
+                                  </div>
+                                  {table.title ? <span className="artifactTitle">{table.title}</span> : null}
+                                  <p>{table.caption}</p>
+                                  <div className="detailGroup">
+                                    <span className="detailLabel">Model reading</span>
+                                    <span>{figureSummaryMode(visualArtifacts, table.id)}</span>
+                                    <span>{displayVisualSummary(visualArtifacts, table.id, table.summary)}</span>
+                                  </div>
+                                  {table.markdownTable ? (
+                                    <details>
+                                      <summary>Extracted table</summary>
+                                      <pre>{table.markdownTable}</pre>
+                                    </details>
+                                  ) : null}
+                                  {table.ocrText.length > 0 ? (
+                                    <details>
+                                      <summary>OCR text</summary>
+                                      <pre>{table.ocrText.join('\n')}</pre>
+                                    </details>
+                                  ) : null}
+                                </div>
+                              </article>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                      {visualArtifacts.visualEvidence.length > 0 ? (
+                        <div className="detailGroup">
+                          <span className="detailLabel">Visual evidence</span>
+                          <div className="evidenceList">
+                            {visualArtifacts.visualEvidence.map((item) => (
+                              <article className="evidenceCard" key={item.id}>
+                                <strong>{item.claim}</strong>
+                                <span>{formatVisualEvidenceMeta(item.supportLevel, item.sourceObjectType, item.sourceObjectId, item.page, item.confidence)}</span>
+                                <p>{item.evidenceText}</p>
+                                <span>{item.locator}</span>
+                              </article>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <p>No extracted figures or tables yet. The parser will use multimodal interpretation when the selected model supports images, then fall back to caption-based extraction.</p>
+                  )}
                 </section>
 
                 <section className="readerPanel readerPanelScrollable readerPanelAnalysis">
@@ -968,6 +1183,19 @@ export function App() {
               <button className="secondaryButton" onClick={() => void handleTestModel()}>Test endpoint</button>
               {selectedModelId ? <button className="secondaryButton" onClick={() => void handleDeleteSelectedModel()}>Delete preset</button> : null}
             </div>
+            {modelNeedsGithubHosting ? (
+              <div className={githubHostingReady ? 'noticeCard noticeCardSuccess' : 'noticeCard noticeCardWarning'}>
+                <strong>Public image URL required</strong>
+                <span>
+                  This model route rejects inline image payloads. Figure and table recognition will upload extracted images to your configured GitHub repository and then send the public URL.
+                </span>
+                <span>
+                  {githubHostingReady
+                    ? 'GitHub hosting is configured, so visual parsing can use the fallback path.'
+                    : 'GitHub hosting is not ready yet. Configure owner, repo, and token in User Profile before running visual parsing. Branch defaults to main when left blank.'}
+                </span>
+              </div>
+            ) : null}
             {modelStatus ? (
               <div className="listItem topGap">
                 <strong>{modelStatus.modelIdentity}</strong>
@@ -976,6 +1204,14 @@ export function App() {
                 <span>Endpoint: {modelStatus.endpoint}</span>
                 <span>Latency: {modelStatus.latencyMs} ms</span>
                 <span>{modelStatus.statusText}</span>
+                <span>Image input: {modelStatus.imageInputSupported ? 'supported' : 'not verified'}</span>
+                <span>{modelStatus.imageInputMessage}</span>
+                <span>
+                  Working format: {modelStatus.imageInputWorkingFormat ?? 'none'}
+                </span>
+                <span>
+                  Attempted formats: {modelStatus.imageProbeAttemptedFormats.join(', ')}
+                </span>
               </div>
             ) : null}
           </section>
@@ -1044,6 +1280,130 @@ function formatRunErrorMessage(message: string | null) {
   }
 
   return message;
+}
+
+function resolveAssetUrl(path: string | null) {
+  if (!path) {
+    return null;
+  }
+
+  const normalized = path.trim().replace(/\\/g, '/');
+  if (!normalized) {
+    return null;
+  }
+
+  if (
+    normalized.startsWith('asset:')
+    || normalized.startsWith('http://')
+    || normalized.startsWith('https://')
+    || normalized.startsWith('data:')
+    || normalized.startsWith('blob:')
+  ) {
+    return normalized;
+  }
+
+  return convertFileSrc(normalized);
+}
+
+function renderVisualPreview(item: ParsedFigure | ParsedTable) {
+  const previewUrl = resolveAssetUrl(item.thumbnailPath ?? item.imagePath);
+  if (!previewUrl) {
+    return (
+      <div className="artifactPreview artifactPreviewPlaceholder">
+        <span>No preview</span>
+      </div>
+    );
+  }
+
+  return <img className="artifactPreview" src={previewUrl} alt={item.label || item.id} />;
+}
+
+function formatArtifactMeta(page: number | null, locator: string, confidence: number | null) {
+  const parts = [page ? `p.${page}` : null, locator || null, confidence != null ? `confidence ${Math.round(confidence * 100)}%` : null].filter(Boolean);
+  return parts.join(' · ') || 'No locator';
+}
+
+function formatVisualEvidenceMeta(
+  supportLevel: string,
+  sourceObjectType: string,
+  sourceObjectId: string,
+  page: number | null,
+  confidence: number | null,
+) {
+  const parts = [supportLevel, `${sourceObjectType}:${sourceObjectId}`, page ? `p.${page}` : null, confidence != null ? `confidence ${Math.round(confidence * 100)}%` : null].filter(Boolean);
+  return parts.join(' · ');
+}
+
+function figureSummaryMode(visualArtifacts: PaperVisualArtifactsResponse, sourceObjectId: string) {
+  const evidence = visualArtifacts.visualEvidence.find((item) => item.sourceObjectId === sourceObjectId);
+  if (!evidence) {
+    return 'No visual understanding result';
+  }
+
+  if (evidence.supportLevel === 'multimodal_direct') {
+    return 'Multimodal interpreted';
+  }
+
+  return `Fallback: ${evidence.supportLevel}`;
+}
+
+function displayVisualSummary(
+  visualArtifacts: PaperVisualArtifactsResponse,
+  sourceObjectId: string,
+  summary: string | null,
+) {
+  const evidence = visualArtifacts.visualEvidence.find((item) => item.sourceObjectId === sourceObjectId);
+  if (!evidence || evidence.supportLevel !== 'multimodal_direct') {
+    return 'Multimodal analysis did not complete for this artifact. Current result only confirms the caption/region match, not the chart content itself.';
+  }
+
+  if (!summary || !summary.trim()) {
+    return 'Multimodal analysis completed, but the model returned no usable summary.';
+  }
+
+  return summary;
+}
+
+function renderVisualDiagnostics(items: VisualDiagnostic[]) {
+  if (!items.length) {
+    return null;
+  }
+
+  return (
+    <div className="detailGroup">
+      <span className="detailLabel">Visual diagnostics</span>
+      <div className="evidenceList">
+        {items.map((item, index) => (
+          <article className="evidenceCard" key={`${item.scope}-${item.code}-${index}`}>
+            <strong>{item.code}</strong>
+            <span>{item.scope} · {item.retryable ? 'retryable' : 'non-retryable'}</span>
+            <p>{item.message}</p>
+          </article>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function renderGitHubUploadDiagnostics(items: VisualDiagnostic[]) {
+  if (!items.length) {
+    return null;
+  }
+
+  return (
+    <div className="detailGroup">
+      <span className="detailLabel">GitHub upload status</span>
+      <div className="evidenceList">
+        {items.map((item, index) => (
+          <article className="evidenceCard" key={`${item.scope}-${item.code}-${index}`}>
+            <strong>{item.code === 'github_upload_succeeded' ? 'upload succeeded' : 'upload failed'}</strong>
+            <span>{item.scope} · {item.retryable ? 'retryable' : 'non-retryable'}</span>
+            <p>{item.message}</p>
+          </article>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function buildWorkflowSteps(currentStep: string | null) {

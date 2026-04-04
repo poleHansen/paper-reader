@@ -6,6 +6,10 @@ pub struct ContextBatch {
     pub batch_index: i32,
     pub section_ids: Vec<String>,
     pub section_titles: Vec<String>,
+    #[serde(default)]
+    pub figure_ids: Vec<String>,
+    #[serde(default)]
+    pub table_ids: Vec<String>,
     pub carry_in_summary_ids: Vec<String>,
     pub prompt_budget_estimate: i32,
 }
@@ -20,7 +24,13 @@ pub struct ContextPlan {
     pub backfill_reason: Option<String>,
     pub gap_categories: Vec<String>,
     pub selected_section_ids: Vec<String>,
+    #[serde(default)]
+    pub selected_figure_ids: Vec<String>,
+    #[serde(default)]
+    pub selected_table_ids: Vec<String>,
     pub used_handoff_summary_ids: Vec<String>,
+    #[serde(default = "default_visual_mode")]
+    pub visual_mode: String,
     pub batch_count: i32,
     pub current_batch_index: i32,
     pub truncated: bool,
@@ -31,10 +41,21 @@ pub struct ContextPlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvidenceItem {
+    #[serde(default = "default_evidence_source_type")]
+    pub source_type: String,
+    pub source_object_id: Option<String>,
     pub quote: String,
     pub section: String,
     pub page: Option<i32>,
     pub locator: String,
+}
+
+fn default_visual_mode() -> String {
+    "disabled".to_string()
+}
+
+fn default_evidence_source_type() -> String {
+    "section_text".to_string()
 }
 
 #[derive(Debug, Deserialize)]

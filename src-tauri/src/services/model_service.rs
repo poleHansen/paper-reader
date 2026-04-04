@@ -7,7 +7,7 @@ use crate::{
         StoredModelConfig, TestModelConnectionRequest, TestModelConnectionResponse,
         UpdateModelConfigRequest,
     },
-    repositories::{database::Database, model_repository::ModelRepository, runtime_repository::probe_model_endpoint},
+    repositories::{database::Database, model_repository::ModelRepository, runtime_repository::{probe_model_endpoint, probe_model_image_support}},
 };
 
 pub struct ModelService {
@@ -96,19 +96,36 @@ impl ModelService {
             base_url: request.base_url.clone(),
             model_name: request.model_name.clone(),
             api_type: request.api_type.clone(),
+            image_input_format: request.image_input_format.clone(),
             agent_type: None,
             is_default: false,
             api_key: Some(request.api_key.clone()),
         };
         let probe = probe_model_endpoint(&runtime_config, "ping").await?;
+        let image_probe = probe_model_image_support(&runtime_config).await?;
+        let inferred_image_format = image_probe.working_format.clone().or_else(|| {
+            let normalized = image_probe.message.to_ascii_lowercase();
+            if normalized.contains("publicly reachable image url") || normalized.contains("inline data urls and raw base64 were rejected") {
+                Some("url_required".to_string())
+            } else if normalized.contains("multimodal image requests consistently failed upstream")
+                || normalized.contains("upstream vision model is unavailable") {
+                Some("upstream_vision_unavailable".to_string())
+            } else {
+                None
+            }
+        });
         Ok(TestModelConnectionResponse {
             connected: true,
             latency_ms: start.elapsed().as_millis(),
             model_identity: format!("{}:{}", request.provider, request.model_name),
             api_type: probe.api_type,
             endpoint: probe.endpoint,
-            status_code: Some(probe.status_code),
+            status_code: image_probe.status_code.or(Some(probe.status_code)),
             status_text: format!("{} request succeeded", probe.api_label),
+            image_input_supported: image_probe.supported,
+            image_input_message: image_probe.message,
+            image_input_working_format: inferred_image_format,
+            image_probe_attempted_formats: image_probe.attempted_formats,
         })
     }
 }

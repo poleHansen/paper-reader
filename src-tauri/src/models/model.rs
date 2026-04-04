@@ -9,6 +9,7 @@ pub struct ModelConfigRequest {
     pub model_name: String,
     pub api_key: String,
     pub api_type: Option<String>,
+    pub image_input_format: Option<String>,
     pub agent_type: Option<String>,
     pub is_default: bool,
 }
@@ -23,6 +24,7 @@ pub struct UpdateModelConfigRequest {
     pub model_name: String,
     pub api_key: String,
     pub api_type: Option<String>,
+    pub image_input_format: Option<String>,
     pub agent_type: Option<String>,
     pub is_default: bool,
 }
@@ -36,6 +38,7 @@ pub struct ModelConfigResponse {
     pub base_url: String,
     pub model_name: String,
     pub api_type: Option<String>,
+    pub image_input_format: Option<String>,
     pub agent_type: Option<String>,
     pub is_default: bool,
     pub is_recent: bool,
@@ -53,6 +56,7 @@ pub struct ModelConfigDetailResponse {
     pub model_name: String,
     pub api_key: String,
     pub api_type: Option<String>,
+    pub image_input_format: Option<String>,
     pub agent_type: Option<String>,
     pub is_default: bool,
     pub is_recent: bool,
@@ -74,6 +78,7 @@ pub struct StoredModelConfig {
     pub base_url: String,
     pub model_name: String,
     pub api_type: Option<String>,
+    pub image_input_format: Option<String>,
     pub agent_type: Option<String>,
     pub is_default: bool,
     pub api_key: Option<String>,
@@ -87,6 +92,7 @@ pub struct TestModelConnectionRequest {
     pub model_name: String,
     pub api_key: String,
     pub api_type: Option<String>,
+    pub image_input_format: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,4 +105,8 @@ pub struct TestModelConnectionResponse {
     pub endpoint: String,
     pub status_code: Option<u16>,
     pub status_text: String,
+    pub image_input_supported: bool,
+    pub image_input_message: String,
+    pub image_input_working_format: Option<String>,
+    pub image_probe_attempted_formats: Vec<String>,
 }

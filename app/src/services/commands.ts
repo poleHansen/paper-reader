@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import {
   confirmPaperMetadataResponseSchema,
   agentRunDetailSchema,
+  githubUploadTestResponseSchema,
   importPaperFromFileResponseSchema,
   libraryItemMutationResponseSchema,
   libraryListResponseSchema,
@@ -11,6 +12,7 @@ import {
   modelConfigResponseSchema,
   paperParseStatusResponseSchema,
   paperSearchResponseSchema,
+  paperVisualArtifactsResponseSchema,
   profileResponseSchema,
   readerSnapshotSchema,
   runAgentResponseSchema,
@@ -21,7 +23,9 @@ import type {
   ConfirmPaperMetadataResponse,
   GetAgentRunRequest,
   GetPaperParseStatusRequest,
+  GetPaperVisualArtifactsRequest,
   GetReaderSnapshotRequest,
+  GitHubUploadTestResponse,
   ImportPaperFromFileRequest,
   ImportPaperFromFileResponse,
   ImportPaperFromLinkRequest,
@@ -34,6 +38,7 @@ import type {
   ModelConfigRequest,
   ModelConfigResponse,
   PaperParseStatusResponse,
+  PaperVisualArtifactsResponse,
   ReaderSnapshot,
   RunAgentRequest,
   RunAgentResponse,
@@ -61,6 +66,11 @@ export async function getProfile(): Promise<UserProfile> {
 export async function upsertProfile(payload: UserProfile): Promise<UserProfile> {
   const response = await invoke('upsert_profile', { request: payload });
   return profileResponseSchema.parse(response);
+}
+
+export async function testGitHubUpload(): Promise<GitHubUploadTestResponse> {
+  const response = await invoke('test_github_upload');
+  return githubUploadTestResponseSchema.parse(response);
 }
 
 export async function saveModelConfig(payload: ModelConfigRequest): Promise<ModelConfigResponse> {
@@ -130,6 +140,12 @@ export async function confirmPaperMetadata(
   return confirmPaperMetadataResponseSchema.parse(response);
 }
 
+export async function reparsePaper(
+  payload: GetPaperParseStatusRequest,
+): Promise<void> {
+  await invoke('reparse_paper', { request: payload });
+}
+
 export async function getPaperParseStatus(
   payload: GetPaperParseStatusRequest,
 ): Promise<PaperParseStatusResponse> {
@@ -142,6 +158,13 @@ export async function getReaderSnapshot(
 ): Promise<ReaderSnapshot> {
   const response = await invoke('get_reader_snapshot', { request: payload });
   return readerSnapshotSchema.parse(response);
+}
+
+export async function getPaperVisualArtifacts(
+  payload: GetPaperVisualArtifactsRequest,
+): Promise<PaperVisualArtifactsResponse> {
+  const response = await invoke('get_paper_visual_artifacts', { request: payload });
+  return paperVisualArtifactsResponseSchema.parse(response);
 }
 
 export async function runAgent(payload: RunAgentRequest): Promise<RunAgentResponse> {
