@@ -56,7 +56,12 @@ impl GitHubAssetService {
         Ok(self.config_status()?.is_configured())
     }
 
-    pub async fn upload_image(&self, image_path: &str, purpose: &str) -> Result<GitHubUploadResult, AppError> {
+    pub async fn upload_image(
+        &self,
+        image_path: &str,
+        purpose: &str,
+        paper_title: Option<&str>,
+    ) -> Result<GitHubUploadResult, AppError> {
         let profile = self.profile_repository.get()?;
         let owner = profile
             .github_repo_owner
@@ -104,10 +109,11 @@ impl GitHubAssetService {
             .map(str::trim)
             .unwrap_or("")
             .trim_matches('/');
+        let paper_directory = build_paper_directory_name(paper_title);
         let repository_path = if prefix.is_empty() {
-            format!("paper-reader/{}/{}.{}", purpose, Uuid::new_v4(), extension)
+            format!("paper-reader/{}/{}/{}.{}", paper_directory, purpose, Uuid::new_v4(), extension)
         } else {
-            format!("{}/paper-reader/{}/{}.{}", prefix, purpose, Uuid::new_v4(), extension)
+            format!("{}/paper-reader/{}/{}/{}.{}", prefix, paper_directory, purpose, Uuid::new_v4(), extension)
         };
 
         let api_url = format!("https://api.github.com/repos/{owner}/{repo}/contents/{repository_path}");
@@ -154,4 +160,73 @@ impl GitHubAssetService {
             repository_path,
         })
     }
+}
+
+fn build_paper_directory_name(paper_title: Option<&str>) -> String {
+    let normalized = paper_title
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(sanitize_directory_segment)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "paper-assets".to_string());
+
+    if normalized.len() <= 48 {
+        normalized
+    } else {
+        abbreviate_directory_segment(&normalized)
+    }
+}
+
+fn sanitize_directory_segment(input: &str) -> String {
+    let mut sanitized = String::with_capacity(input.len());
+    let mut previous_was_separator = false;
+
+    for ch in input.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else if ch.is_whitespace() || matches!(ch, '-' | '_' | '.' | '/' | '\\' | ':' | ';' | ',' | '(' | ')' | '[' | ']') {
+            Some('-')
+        } else {
+            None
+        };
+
+        match mapped {
+            Some('-') => {
+                if !previous_was_separator && !sanitized.is_empty() {
+                    sanitized.push('-');
+                }
+                previous_was_separator = true;
+            }
+            Some(value) => {
+                sanitized.push(value);
+                previous_was_separator = false;
+            }
+            None => {}
+        }
+    }
+
+    sanitized.trim_matches('-').to_string()
+}
+
+fn abbreviate_directory_segment(input: &str) -> String {
+    let tokens = input
+        .split('-')
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+
+    let mut abbreviation = String::new();
+    for token in &tokens {
+        if let Some(ch) = token.chars().next() {
+            abbreviation.push(ch);
+        }
+        if abbreviation.len() >= 12 {
+            break;
+        }
+    }
+
+    if abbreviation.len() >= 3 {
+        return abbreviation;
+    }
+
+    input.chars().take(12).collect()
 }

@@ -46,7 +46,7 @@ import type {
   VisualDiagnostic,
 } from '../types/contracts';
 
-type View = 'dashboard' | 'onboarding' | 'search' | 'upload' | 'reader' | 'library' | 'model';
+type View = 'dashboard' | 'onboarding' | 'search' | 'upload' | 'reader' | 'visuals' | 'library' | 'model';
 
 const navigationItems: Array<{ view: View; label: string }> = [
   { view: 'dashboard', label: 'Dashboard' },
@@ -54,6 +54,7 @@ const navigationItems: Array<{ view: View; label: string }> = [
   { view: 'search', label: 'Search' },
   { view: 'upload', label: 'Upload' },
   { view: 'reader', label: 'Reader' },
+  { view: 'visuals', label: 'Visual Artifacts' },
   { view: 'library', label: 'Library' },
   { view: 'model', label: 'Model Settings' },
 ];
@@ -116,7 +117,6 @@ export function App() {
   });
   const [activeRun, setActiveRun] = useState<AgentRunDetail | null>(null);
   const libraryHighlights = libraryItems.slice(0, 3);
-  const workflowSteps = buildWorkflowSteps(readerSnapshot?.workflowCurrentStep ?? null);
   const effectiveGithubBranch = profile.githubRepoBranch?.trim() || 'main';
   const hasGithubTokenValue = Boolean(profile.githubToken?.trim() || profile.hasGithubToken);
   const githubHostingReady = Boolean(
@@ -385,9 +385,14 @@ export function App() {
       setSelectedPaperId(result.paperId);
       setMetadataDraft((current) => ({ ...current, paperId: result.paperId, title: getFileNameFromPath(filePath) }));
       setStatusText(`Imported ${result.paperId}`);
-      await loadReaderSnapshot(result.paperId);
+      if (!result.metadataNeedsConfirmation) {
+        await loadReaderSnapshot(result.paperId);
+      } else {
+        setReaderSnapshot(null);
+        setVisualArtifacts(null);
+      }
       await refreshLibrary();
-      setActiveView('reader');
+      setActiveView(result.metadataNeedsConfirmation ? 'upload' : 'reader');
     } catch (error) {
       setStatusText(formatError(error));
     }
@@ -419,7 +424,12 @@ export function App() {
       setSelectedPaperId(result.paperId);
       setMetadataDraft((current) => ({ ...current, paperId: result.paperId, title: paperUrl }));
       setStatusText(`Imported ${result.paperId} from link`);
-      await loadReaderSnapshot(result.paperId);
+      if (!result.metadataNeedsConfirmation) {
+        await loadReaderSnapshot(result.paperId);
+      } else {
+        setReaderSnapshot(null);
+        setVisualArtifacts(null);
+      }
       await refreshLibrary();
       setActiveView(result.metadataNeedsConfirmation ? 'upload' : 'reader');
     } catch (error) {
@@ -431,6 +441,20 @@ export function App() {
     try {
       const snapshot = await getReaderSnapshot({ paperId });
       setReaderSnapshot(snapshot);
+      setActiveRun((current) => {
+        if (current && snapshot.latestAgentRuns.some((run) => run.id === current.id)) {
+          return current;
+        }
+
+        return null;
+      });
+
+      if (snapshot.latestAgentRuns.length > 0) {
+        const latestRunId = snapshot.latestAgentRuns[0].id;
+        void getAgentRun({ runId: latestRunId })
+          .then(setActiveRun)
+          .catch((error) => setStatusText(formatError(error)));
+      }
 
       if (snapshot.parsedContent) {
         const artifacts = await getPaperVisualArtifacts({ paperId });
@@ -825,59 +849,220 @@ export function App() {
         ) : null}
 
         {activeView === 'reader' ? (
-          <section className="card pageCard">
+          <section className="card pageCard pageCardReaderModern">
             <div className="sectionHeader">
               <div>
                 <span className="eyebrow">Reader</span>
                 <h2>Paper workspace</h2>
-                <p className="muted">Current implementation is a minimal snapshot view. It now behaves like a real destination in the flow.</p>
+                <p className="muted">Read the original paper on the left and review the current agent output on the right.</p>
               </div>
-              <div className="row rowWrap">
+              <div className="row rowWrap readerHeaderActions">
+                {readerSnapshot?.allowedActions.includes('run_quick_read') ? <button onClick={() => void handleRunAgent('quick_read')}>Quick read</button> : null}
+                {readerSnapshot?.allowedActions.includes('run_careful_read') ? <button onClick={() => void handleRunAgent('careful_read')}>Careful read</button> : null}
+                {readerSnapshot?.allowedActions.includes('run_deep_read') ? <button onClick={() => void handleRunAgent('deep_read')}>Deep read</button> : null}
+                {readerSnapshot?.allowedActions.includes('run_summary') ? <button onClick={() => void handleRunAgent('summary')}>Summary</button> : null}
+                <button
+                  className="secondaryButton"
+                  onClick={() => setActiveView('visuals')}
+                  disabled={!selectedPaperId}
+                >
+                  Open visual artifacts
+                </button>
                 <button className="secondaryButton" onClick={() => void handleReparsePaper()} disabled={!selectedPaperId}>Reparse paper</button>
                 <button onClick={() => void handleRefreshParseStatus()} disabled={!selectedPaperId}>Refresh status</button>
               </div>
             </div>
             {readerSnapshot ? (
-              <div className="readerGrid">
-                <section className="readerPanel">
-                  <span className="eyebrow">Document</span>
-                  <strong>{readerSnapshot.title}</strong>
-                  <span>{readerSnapshot.authors.length > 0 ? readerSnapshot.authors.join(', ') : 'Authors unavailable'}</span>
-                  <span>{readerSnapshot.venue ?? 'Unknown venue'} · {readerSnapshot.year ?? 'unknown year'}</span>
-                  <span>Source: {readerSnapshot.source}</span>
-                  <span>File: {readerSnapshot.fileName ?? 'No local file recorded'}</span>
-                  <span>MIME: {readerSnapshot.mimeType ?? 'unknown'}</span>
-                  <span>Size: {readerSnapshot.sizeBytes ?? 0} bytes</span>
-                </section>
+              <>
+                <div className="workflowStrip">
+                  <article className="workflowStripCard">
+                    <span className="detailLabel">Parse</span>
+                    <strong>{formatParseStatus(readerSnapshot.parseStatus)}</strong>
+                  </article>
+                  <article className="workflowStripCard">
+                    <span className="detailLabel">Progress</span>
+                    <strong>{readerSnapshot.parseProgress}%</strong>
+                  </article>
+                  <article className="workflowStripCard">
+                    <span className="detailLabel">Current step</span>
+                    <strong>{formatWorkflowStep(readerSnapshot.workflowCurrentStep)}</strong>
+                  </article>
+                  <article className="workflowStripCard">
+                    <span className="detailLabel">Next action</span>
+                    <strong>{formatActionLabel(readerSnapshot.nextActionRequired) ?? 'None'}</strong>
+                  </article>
+                  <article className="workflowStripCard">
+                    <span className="detailLabel">Library</span>
+                    <strong>{formatLibraryStatus(readerSnapshot.libraryStatus)}</strong>
+                  </article>
+                </div>
 
-                <section className="readerPanel readerPanelScrollable">
-                  <span className="eyebrow">Workflow</span>
-                  <strong>Parse: {formatParseStatus(readerSnapshot.parseStatus)}</strong>
-                  <span>Progress: {readerSnapshot.parseProgress}%</span>
-                  <span>Current step: {formatWorkflowStep(readerSnapshot.workflowCurrentStep)}</span>
-                  <span>Next action: {formatActionLabel(readerSnapshot.nextActionRequired) ?? 'None'}</span>
-                  <span>Library status: {formatLibraryStatus(readerSnapshot.libraryStatus)}</span>
-                  <span>Starred: {readerSnapshot.starred ? 'Yes' : 'No'}</span>
-                  <span>Allowed actions: {formatAllowedActions(readerSnapshot.allowedActions)}</span>
-                  <div className="workflowTimeline">
-                    {workflowSteps.map((step) => (
-                      <div key={step.id} className={`timelineStep ${step.state}`}>
-                        <strong>{step.label}</strong>
-                        <span>{step.caption}</span>
+                <div className="readerSplitLayout">
+                  <section className="readerDocumentPane">
+                    <div className="readerPaneHeader">
+                      <div>
+                        <span className="eyebrow">Paper</span>
+                        <strong>{readerSnapshot.title}</strong>
+                        <p className="muted">
+                          {readerSnapshot.authors.length > 0 ? readerSnapshot.authors.join(', ') : 'Authors unavailable'}
+                          {' · '}
+                          {readerSnapshot.venue ?? 'Unknown venue'}
+                          {' · '}
+                          {readerSnapshot.year ?? 'unknown year'}
+                        </p>
                       </div>
-                    ))}
-                  </div>
-                  <div className="actionStack">
-                    {readerSnapshot.allowedActions.includes('run_quick_read') ? <button onClick={() => void handleRunAgent('quick_read')}>Run quick read</button> : null}
-                    {readerSnapshot.allowedActions.includes('run_careful_read') ? <button onClick={() => void handleRunAgent('careful_read')}>Run careful read</button> : null}
-                    {readerSnapshot.allowedActions.includes('run_deep_read') ? <button onClick={() => void handleRunAgent('deep_read')}>Run deep read</button> : null}
-                    {readerSnapshot.allowedActions.includes('run_summary') ? <button onClick={() => void handleRunAgent('summary')}>Run summary</button> : null}
-                  </div>
-                  {readerSnapshot.parseErrorMessage ? <span>Error: {readerSnapshot.parseErrorMessage}</span> : null}
-                </section>
+                    </div>
+                    <div className="readerDocumentViewport">
+                      {renderPaperDocument(readerSnapshot)}
+                    </div>
+                  </section>
 
-                <section className="readerPanel readerPanelScrollable">
-                  <span className="eyebrow">Visual artifacts</span>
+                  <section className="readerAgentPane">
+                    <div className="readerPaneHeader">
+                      <div>
+                        <span className="eyebrow">Analysis</span>
+                        <strong>Current agent output</strong>
+                        <p className="muted">This panel focuses on the latest reading result instead of workflow state.</p>
+                      </div>
+                    </div>
+
+                    <div className="readerAgentBody">
+                      {readerSnapshot.activeRun ? (
+                        <section className="readerPanel">
+                          <span className="detailLabel">Running now</span>
+                          <strong>{readerSnapshot.activeRun.agentType}</strong>
+                          <span>Batch {readerSnapshot.activeRun.currentBatchIndex} / {readerSnapshot.activeRun.currentBatchCount}</span>
+                          <span>Sections: {readerSnapshot.activeRun.contextPlan.selectedSectionIds.join(', ') || 'none'}</span>
+                          <span>Mode: {readerSnapshot.activeRun.contextPlan.runtimeMode} / {readerSnapshot.activeRun.contextPlan.sectionStrategy}</span>
+                        </section>
+                      ) : null}
+
+                      {readerSnapshot.latestAgentRuns.length > 0 ? (
+                        <section className="readerRunSwitcher">
+                          <span className="detailLabel">Recent runs</span>
+                          <div className="runChipList">
+                            {readerSnapshot.latestAgentRuns.map((run) => (
+                              <button
+                                key={run.id}
+                                className={`runChip ${activeRun?.id === run.id ? 'runChipActive' : ''}`}
+                                onClick={() => {
+                                  void getAgentRun({ runId: run.id })
+                                    .then(setActiveRun)
+                                    .catch((error) => setStatusText(formatError(error)));
+                                }}
+                              >
+                                {run.agentType}
+                              </button>
+                            ))}
+                          </div>
+                        </section>
+                      ) : null}
+
+                      {activeRun ? (
+                        <section className="readerPanel readerPanelScrollable">
+                          <span className="detailLabel">Selected result</span>
+                          <div className="runCard">
+                            <strong>{activeRun.agentType}</strong>
+                            <span>Status: {activeRun.status}</span>
+                            <span>Finished: {activeRun.finishedAt ?? 'n/a'}</span>
+                            {activeRun.contextPlan ? (
+                              <div className="detailGroup">
+                                <span className="detailLabel">Context plan</span>
+                                <span>Mode: {activeRun.contextPlan.runtimeMode}</span>
+                                <span>Strategy: {activeRun.contextPlan.sectionStrategy}</span>
+                                <p>{activeRun.contextPlan.selectionReason}</p>
+                                <span>Sections: {activeRun.contextPlan.selectedSectionIds.join(', ') || 'none'}</span>
+                              </div>
+                            ) : null}
+                            {activeRun.status === 'failed' ? (
+                              <div className="detailGroup">
+                                <span className="detailLabel">Failure details</span>
+                                <span>Code: {activeRun.errorCode ?? 'UNKNOWN_ERROR'}</span>
+                                <p>{formatRunErrorMessage(activeRun.errorMessage)}</p>
+                              </div>
+                            ) : null}
+                            <div className="jsonPreview">
+                              {renderRunSnapshot(activeRun.outputSnapshot)}
+                            </div>
+                            {activeRun.handoffSummary ? (
+                              <div className="handoffCard">
+                                <strong>{activeRun.handoffSummary.stage}</strong>
+                                <p>{activeRun.handoffSummary.compressedConclusion}</p>
+                                {activeRun.handoffSummary.keyPoints.length > 0 ? (
+                                  <div className="detailGroup">
+                                    <span className="detailLabel">Key points</span>
+                                    <ul className="detailList">
+                                      {activeRun.handoffSummary.keyPoints.map((item) => (
+                                        <li key={item}>{item}</li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                ) : null}
+                                {activeRun.handoffSummary.carryForwardQuestions.length > 0 ? (
+                                  <div className="detailGroup">
+                                    <span className="detailLabel">Carry-forward questions</span>
+                                    <ul className="detailList">
+                                      {activeRun.handoffSummary.carryForwardQuestions.map((item) => (
+                                        <li key={item}>{item}</li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                ) : null}
+                                {activeRun.handoffSummary.carryForwardEvidence.length > 0 ? (
+                                  <div className="detailGroup">
+                                    <span className="detailLabel">Carry-forward evidence</span>
+                                    <div className="evidenceList">
+                                      {activeRun.handoffSummary.carryForwardEvidence.map((item, index) => (
+                                        <article className="evidenceCard" key={`${item.locator}-${index}`}>
+                                          <strong>{item.section}</strong>
+                                          <p>{item.quote}</p>
+                                          <span>{formatEvidenceMeta(item)}</span>
+                                        </article>
+                                      ))}
+                                    </div>
+                                  </div>
+                                ) : null}
+                                <span>Next: {activeRun.handoffSummary.nextStepSuggestion}</span>
+                              </div>
+                            ) : null}
+                          </div>
+                        </section>
+                      ) : (
+                        <div className="emptyState compactEmpty">
+                          <strong>No selected result yet</strong>
+                          <span>Run an agent from the workflow bar or choose one of the recent run buttons.</span>
+                        </div>
+                      )}
+                    </div>
+                  </section>
+                </div>
+              </>
+            ) : (
+              <div className="emptyState">
+                <strong>Reader is waiting for a paper</strong>
+                <span>Import a PDF or open an item from the library to load the workspace.</span>
+              </div>
+            )}
+          </section>
+        ) : null}
+
+        {activeView === 'visuals' ? (
+          <section className="card pageCard pageCardReaderModern">
+            <div className="sectionHeader">
+              <div>
+                <span className="eyebrow">Visual artifacts</span>
+                <h2>Figures, tables, and evidence</h2>
+                <p className="muted">Visual parsing results are separated from the reading workspace so the Reader can stay focused.</p>
+              </div>
+              <div className="row rowWrap">
+                <button className="secondaryButton" onClick={() => setActiveView('reader')} disabled={!selectedPaperId}>Back to reader</button>
+                <button onClick={() => void handleRefreshParseStatus()} disabled={!selectedPaperId}>Refresh status</button>
+              </div>
+            </div>
+            {readerSnapshot ? (
+              <div className="visualsPageLayout">
+                <section className="readerPanel">
+                  <span className="eyebrow">Overview</span>
                   <strong>
                     Figures {readerSnapshot.parsedContent?.figureCount ?? 0} · Tables {readerSnapshot.parsedContent?.tableCount ?? 0}
                   </strong>
@@ -900,6 +1085,9 @@ export function App() {
                   <span>Warnings: {readerSnapshot.parsedContent?.visualWarnings.join(' | ') || 'none'}</span>
                   {renderGitHubUploadDiagnostics(readerSnapshot.parsedContent?.githubUploadDiagnostics ?? [])}
                   {renderVisualDiagnostics(readerSnapshot.parsedContent?.visualDiagnostics ?? [])}
+                </section>
+
+                <section className="readerPanel readerPanelScrollable">
                   {visualArtifacts && (visualArtifacts.figures.length > 0 || visualArtifacts.tables.length > 0 || visualArtifacts.visualEvidence.length > 0) ? (
                     <div className="detailGroup">
                       {renderGitHubUploadDiagnostics(visualArtifacts.githubUploadDiagnostics)}
@@ -992,127 +1180,11 @@ export function App() {
                     <p>No extracted figures or tables yet. The parser will use multimodal interpretation when the selected model supports images, then fall back to caption-based extraction.</p>
                   )}
                 </section>
-
-                <section className="readerPanel readerPanelScrollable readerPanelAnalysis">
-                  <span className="eyebrow">Analysis</span>
-                  <p>{readerSnapshot.abstractText ?? 'No abstract available yet. This paper is waiting for the parse pipeline and agent runtime.'}</p>
-                  <span>Tags: {readerSnapshot.libraryTags.length > 0 ? readerSnapshot.libraryTags.join(', ') : 'none'}</span>
-                  <span>Latest handoff ids: {readerSnapshot.latestHandoffSummaryIds.join(', ') || 'none yet'}</span>
-                  <span>Fallback actions: {readerSnapshot.fallbackActions.join(', ') || 'none'}</span>
-                  {readerSnapshot.activeRun ? (
-                    <div className="detailGroup">
-                      <span className="detailLabel">Active batch run</span>
-                      <span>{readerSnapshot.activeRun.agentType} · 第 {readerSnapshot.activeRun.currentBatchIndex} / {readerSnapshot.activeRun.currentBatchCount} 批分析中</span>
-                      <span>Sections: {readerSnapshot.activeRun.contextPlan.selectedSectionIds.join(', ') || 'none'}</span>
-                      <span>Mode: {readerSnapshot.activeRun.contextPlan.runtimeMode} / {readerSnapshot.activeRun.contextPlan.sectionStrategy}</span>
-                    </div>
-                  ) : null}
-                  {readerSnapshot.latestAgentRuns.length > 0 ? (
-                    <div className="runList">
-                      {readerSnapshot.latestAgentRuns.map((run) => (
-                        <button
-                          key={run.id}
-                          className="runListItem secondaryButton"
-                          onClick={() => {
-                            void getAgentRun({ runId: run.id })
-                              .then(setActiveRun)
-                              .catch((error) => setStatusText(formatError(error)));
-                          }}
-                        >
-                          <strong>{run.agentType}</strong>
-                          <span>{run.status}</span>
-                          <span>{run.contextPlan ? `sections ${run.contextPlan.selectedSectionIds.length}, batches ${run.contextPlan.batchCount}` : 'no context plan'}</span>
-                          <span>{run.summary ?? 'No summary yet'}</span>
-                        </button>
-                      ))}
-                    </div>
-                  ) : null}
-                  {activeRun ? (
-                    <div className="runCard">
-                      <strong>{activeRun.agentType}</strong>
-                      <span>Status: {activeRun.status}</span>
-                      <span>Finished: {activeRun.finishedAt ?? 'n/a'}</span>
-                      {activeRun.contextPlan ? (
-                        <div className="detailGroup">
-                          <span className="detailLabel">Context plan</span>
-                          <span>Mode: {activeRun.contextPlan.runtimeMode}</span>
-                          <span>Strategy: {activeRun.contextPlan.sectionStrategy}</span>
-                          <p>{activeRun.contextPlan.selectionReason}</p>
-                          <span>
-                            Handoff chain: {activeRun.contextPlan.handoffChainComplete ? 'complete' : 'incomplete'}
-                          </span>
-                          <span>
-                            Handoff summaries: {activeRun.contextPlan.usedHandoffSummaryIds.join(', ') || 'none'}
-                          </span>
-                          <span>
-                            Gap categories: {activeRun.contextPlan.gapCategories.join(', ') || 'none'}
-                          </span>
-                          {activeRun.contextPlan.backfillReason ? (
-                            <p>{activeRun.contextPlan.backfillReason}</p>
-                          ) : null}
-                          <span>Sections: {activeRun.contextPlan.selectedSectionIds.join(', ') || 'none'}</span>
-                          <span>Batch progress: {activeRun.contextPlan.currentBatchIndex} / {activeRun.contextPlan.batchCount}</span>
-                        </div>
-                      ) : null}
-                      {activeRun.status === 'failed' ? (
-                        <div className="detailGroup">
-                          <span className="detailLabel">Failure details</span>
-                          <span>Code: {activeRun.errorCode ?? 'UNKNOWN_ERROR'}</span>
-                          <p>{formatRunErrorMessage(activeRun.errorMessage)}</p>
-                        </div>
-                      ) : null}
-                      <div className="jsonPreview">
-                        {renderRunSnapshot(activeRun.outputSnapshot)}
-                      </div>
-                      {activeRun.handoffSummary ? (
-                        <div className="handoffCard">
-                          <strong>{activeRun.handoffSummary.stage}</strong>
-                          <p>{activeRun.handoffSummary.compressedConclusion}</p>
-                          {activeRun.handoffSummary.keyPoints.length > 0 ? (
-                            <div className="detailGroup">
-                              <span className="detailLabel">Key points</span>
-                              <ul className="detailList">
-                                {activeRun.handoffSummary.keyPoints.map((item) => (
-                                  <li key={item}>{item}</li>
-                                ))}
-                              </ul>
-                            </div>
-                          ) : null}
-                          {activeRun.handoffSummary.carryForwardQuestions.length > 0 ? (
-                            <div className="detailGroup">
-                              <span className="detailLabel">Carry-forward questions</span>
-                              <ul className="detailList">
-                                {activeRun.handoffSummary.carryForwardQuestions.map((item) => (
-                                  <li key={item}>{item}</li>
-                                ))}
-                              </ul>
-                            </div>
-                          ) : null}
-                          {activeRun.handoffSummary.carryForwardEvidence.length > 0 ? (
-                            <div className="detailGroup">
-                              <span className="detailLabel">Carry-forward evidence</span>
-                              <div className="evidenceList">
-                                {activeRun.handoffSummary.carryForwardEvidence.map((item, index) => (
-                                  <article className="evidenceCard" key={`${item.locator}-${index}`}>
-                                    <strong>{item.section}</strong>
-                                    <p>{item.quote}</p>
-                                    <span>{formatEvidenceMeta(item)}</span>
-                                  </article>
-                                ))}
-                              </div>
-                            </div>
-                          ) : null}
-                          <span>Next: {activeRun.handoffSummary.nextStepSuggestion}</span>
-                        </div>
-                      ) : null}
-                    </div>
-                  ) : null}
-                </section>
               </div>
             ) : (
               <div className="emptyState">
-                <strong>Reader is waiting for a paper</strong>
-                <span>Import a PDF or open an item from the library to load the snapshot view.</span>
+                <strong>Visual artifacts are waiting for a paper</strong>
+                <span>Open a paper in the Reader first, then come back here for figure and table details.</span>
               </div>
             )}
           </section>
@@ -1326,6 +1398,29 @@ function resolveAssetUrl(path: string | null) {
   return convertFileSrc(normalized);
 }
 
+function renderPaperDocument(readerSnapshot: ReaderSnapshot) {
+  const documentUrl = resolveAssetUrl(readerSnapshot.storagePath);
+
+  if (documentUrl) {
+    return (
+      <iframe
+        className="readerDocumentFrame"
+        src={documentUrl}
+        title={readerSnapshot.title}
+      />
+    );
+  }
+
+  return (
+    <div className="emptyState compactEmpty">
+      <strong>Paper preview unavailable</strong>
+      <span>The current snapshot does not expose a readable PDF path yet.</span>
+      <span>File: {readerSnapshot.fileName ?? 'No local file recorded'}</span>
+      <span>Source: {readerSnapshot.source}</span>
+    </div>
+  );
+}
+
 function renderVisualPreview(item: ParsedFigure | ParsedTable) {
   const previewUrl = resolveAssetUrl(item.thumbnailPath ?? item.imagePath);
   if (!previewUrl) {
@@ -1427,77 +1522,6 @@ function renderGitHubUploadDiagnostics(items: VisualDiagnostic[]) {
   );
 }
 
-function buildWorkflowSteps(currentStep: string | null) {
-  const ordered = [
-    { id: 'paper_ready', label: 'Paper ready', runningIds: [] },
-    { id: 'quick_read_completed', label: 'Quick read', runningIds: ['quick_read_running'] },
-    { id: 'careful_read_completed', label: 'Careful read', runningIds: ['careful_read_running'] },
-    { id: 'deep_read_completed', label: 'Deep read', runningIds: ['deep_read_running'] },
-    { id: 'summary_completed', label: 'Summary', runningIds: ['summary_running'] },
-  ];
-
-  if (currentStep === 'workflow_blocked') {
-    return ordered.map((item) => ({
-      ...item,
-      state: item.id === 'paper_ready' ? 'blocked' : 'pending',
-      caption: item.id === 'paper_ready' ? 'Blocked' : 'Waiting',
-    }));
-  }
-
-  const completedIndex = ordered.findIndex((item) => item.id === currentStep);
-  const runningIndex = ordered.findIndex((item) => item.runningIds.includes(currentStep ?? ''));
-  const currentIndex = runningIndex >= 0 ? runningIndex : completedIndex;
-  const isRunning = runningIndex >= 0;
-
-  return ordered.map((item, index) => {
-    if (currentIndex < 0) {
-      return {
-        ...item,
-        state: 'pending',
-        caption: 'Waiting',
-      };
-    }
-
-    if (isRunning) {
-      if (index < currentIndex) {
-        return {
-          ...item,
-          state: 'done',
-          caption: 'Completed',
-        };
-      }
-
-      if (index === currentIndex) {
-        return {
-          ...item,
-          state: 'active',
-          caption: 'Running',
-        };
-      }
-
-      return {
-        ...item,
-        state: 'pending',
-        caption: 'Waiting',
-      };
-    }
-
-    if (index <= currentIndex) {
-      return {
-        ...item,
-        state: index === currentIndex ? 'done' : 'done',
-        caption: 'Completed',
-      };
-    }
-
-    return {
-      ...item,
-      state: 'pending',
-      caption: 'Waiting',
-    };
-  });
-}
-
 function formatParseStatus(status: string | null) {
   switch (status) {
     case 'queued':
@@ -1563,14 +1587,6 @@ function formatActionLabel(action: string | null) {
     default:
       return action;
   }
-}
-
-function formatAllowedActions(actions: string[]) {
-  if (actions.length === 0) {
-    return 'None';
-  }
-
-  return actions.map((action) => formatActionLabel(action) ?? action).join(', ');
 }
 
 function formatLibraryStatus(status: string | null) {

@@ -131,6 +131,13 @@ select {
   overflow: hidden;
 }
 
+.pageCardReaderModern {
+  min-height: calc(100vh - 4rem);
+  display: grid;
+  gap: 1rem;
+  align-content: start;
+}
+
 .hero {
   display: flex;
   align-items: end;
@@ -216,6 +223,101 @@ select {
   min-height: 0;
   height: calc(100vh - 12.5rem);
   overflow: hidden;
+}
+
+.workflowStrip {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0.6rem;
+}
+
+.workflowStripCard {
+  display: grid;
+  gap: 0.2rem;
+  align-content: start;
+  padding: 0.7rem 0.85rem;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(30, 25, 20, 0.08);
+}
+
+.workflowStripCard strong {
+  font-size: 0.95rem;
+  line-height: 1.2;
+}
+
+.readerHeaderActions {
+  justify-content: flex-end;
+}
+
+.readerSplitLayout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(360px, 0.9fr);
+  gap: 1rem;
+  min-height: calc(100vh - 16rem);
+}
+
+.readerDocumentPane,
+.readerAgentPane,
+.visualsPageLayout {
+  min-height: 0;
+}
+
+.readerDocumentPane,
+.readerAgentPane {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.readerPaneHeader {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.readerDocumentViewport {
+  min-height: 0;
+  height: calc(100vh - 19.5rem);
+  overflow: hidden;
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.58);
+  border: 1px solid rgba(30, 25, 20, 0.08);
+}
+
+.readerDocumentFrame {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #fff;
+}
+
+.readerAgentBody {
+  min-height: 0;
+  height: calc(100vh - 19.5rem);
+  display: grid;
+  gap: 0.85rem;
+  align-content: start;
+  overflow-y: auto;
+  padding-right: 0.35rem;
+}
+
+.actionStackInline {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.35rem;
+}
+
+.workflowStripActions button {
+  padding: 0.5rem 0.7rem;
+  font-size: 0.92rem;
+  border-radius: 14px;
+}
+
+.visualsPageLayout {
+  display: grid;
+  grid-template-columns: minmax(320px, 0.8fr) minmax(0, 1.4fr);
+  gap: 1rem;
+  min-height: calc(100vh - 16rem);
 }
 
 .gridThree {
@@ -359,8 +461,8 @@ select {
 }
 
 .detailLabel {
-  font-size: 0.82rem;
-  letter-spacing: 0.06em;
+  font-size: 0.72rem;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
   color: rgba(30, 25, 20, 0.58);
 }
@@ -453,6 +555,30 @@ pre {
   gap: 0.5rem;
 }
 
+.readerRunSwitcher {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.runChipList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.runChip {
+  padding: 0.5rem 0.85rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.7);
+  color: #1e1914;
+  border: 1px solid rgba(30, 25, 20, 0.12);
+}
+
+.runChipActive {
+  background: #1e1914;
+  color: #fff;
+}
+
 .runListItem {
   display: grid;
   gap: 0.2rem;
@@ -524,7 +650,11 @@ pre {
   .grid,
   .readerGrid,
   .gridThree,
-  .formGrid {
+  .formGrid,
+  .workflowStrip,
+  .readerSplitLayout,
+  .visualsPageLayout,
+  .actionStackInline {
     grid-template-columns: 1fr;
   }
 
@@ -534,21 +664,34 @@ pre {
 
   .hero,
   .sectionHeader,
-  .row {
+  .row,
+  .readerPaneHeader {
     flex-direction: column;
     align-items: stretch;
   }
 
   .content,
   .pageCardReader,
+  .pageCardReaderModern,
   .readerGrid,
-  .readerPanelAnalysis {
+  .readerPanelAnalysis,
+  .readerDocumentViewport,
+  .readerAgentBody,
+  .readerSplitLayout,
+  .visualsPageLayout {
     min-height: auto;
     height: auto;
   }
 
   .pageCardReader,
-  .readerPanelAnalysis {
+  .pageCardReaderModern,
+  .readerPanelAnalysis,
+  .readerDocumentViewport,
+  .readerAgentBody {
     overflow: visible;
+  }
+
+  .readerDocumentFrame {
+    min-height: 70vh;
   }
 }

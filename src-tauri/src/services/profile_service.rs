@@ -54,7 +54,7 @@ impl ProfileService {
         let temp_path = write_test_image().await?;
         let upload = self
             .github_asset_service
-            .upload_image(&temp_path.to_string_lossy(), "connectivity-test")
+            .upload_image(&temp_path.to_string_lossy(), "connectivity-test", None)
             .await;
         let _ = tokio::fs::remove_file(&temp_path).await;
 

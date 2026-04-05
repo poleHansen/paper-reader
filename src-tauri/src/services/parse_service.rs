@@ -88,6 +88,18 @@ impl ParseService {
         })
     }
 
+    fn load_paper_title(&self, paper_id: &str) -> Result<String, AppError> {
+        self.database.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT title FROM papers WHERE id = ?1 LIMIT 1",
+                    rusqlite::params![paper_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(AppError::from)
+        })
+    }
+
     async fn invoke_sidecar<R: Runtime>(&self, app: &AppHandle<R>, paper_id: &str, pdf_path: &str) -> Result<ParsedPaperContent, AppError> {
         let sidecar_root = resolve_sidecar_root(app)?;
         let main_script = sidecar_root.join("main.py");
@@ -178,12 +190,13 @@ impl ParseService {
             },
         };
 
-        self.enrich_visuals_with_multimodal(&mut parsed).await?;
+        let paper_title = self.load_paper_title(paper_id).ok();
+        self.enrich_visuals_with_multimodal(&mut parsed, paper_title.as_deref()).await?;
 
         Ok(parsed)
     }
 
-    async fn enrich_visuals_with_multimodal(&self, parsed: &mut ParsedPaperContent) -> Result<(), AppError> {
+    async fn enrich_visuals_with_multimodal(&self, parsed: &mut ParsedPaperContent, paper_title: Option<&str>) -> Result<(), AppError> {
         if parsed.figures.is_empty() && parsed.tables.is_empty() {
             return Ok(());
         }
@@ -240,6 +253,7 @@ impl ParseService {
                 figure.label.clone(),
                 figure.caption.clone(),
                 figure.image_path.clone(),
+                paper_title.map(str::to_string),
             ).await {
                 Ok(outcome) => {
                     if let Some(upload_warning) = outcome.upload_warning {
@@ -289,6 +303,7 @@ impl ParseService {
                 table.label.clone(),
                 table.caption.clone(),
                 table.image_path.clone(),
+                paper_title.map(str::to_string),
             ).await {
                 Ok(outcome) => {
                     if let Some(upload_warning) = outcome.upload_warning {
@@ -1004,6 +1019,7 @@ async fn prepare_visual_input(
     artifact_scope: &str,
     artifact_type: &str,
     image_path: &str,
+    paper_title: Option<&str>,
 ) -> Result<PreparedVisualInput, String> {
     let resolved_image_path = resolve_visual_asset_path(image_path)
         .ok_or_else(|| format!("failed to locate image asset from path: {}", image_path))?;
@@ -1021,7 +1037,7 @@ async fn prepare_visual_input(
     }
 
     let upload_result = github_asset_service
-        .upload_image(&resolved_image_path, artifact_type)
+        .upload_image(&resolved_image_path, artifact_type, paper_title)
         .await;
 
     match upload_result {
@@ -1077,6 +1093,7 @@ async fn interpret_visual_artifact_with_timeout(
     label: String,
     caption: String,
     image_path: String,
+    paper_title: Option<String>,
 ) -> Result<VisualInterpretationOutcome, String> {
     if model_config.image_input_format.as_deref() == Some("upstream_vision_unavailable") {
         return Err("multimodal image requests are disabled for this model config because the upstream vision route consistently failed during probing".into());
@@ -1088,6 +1105,7 @@ async fn interpret_visual_artifact_with_timeout(
         &label,
         &artifact_type,
         &image_path,
+        paper_title.as_deref(),
     ).await?;
 
     let requires_public_url = model_config.image_input_format.as_deref() == Some("url_required");
