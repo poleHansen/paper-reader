@@ -172,6 +172,7 @@ export const profileResponseSchema = z.object({
   githubRepoBranch: z.string().nullable(),
   githubRepoPathPrefix: z.string().nullable(),
   githubCdnBaseUrl: z.string().nullable(),
+  githubToken: z.string().nullable().optional(),
   hasGithubToken: z.boolean().optional(),
   id: z.string(),
   updatedAt: z.string(),

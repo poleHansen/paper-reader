@@ -86,6 +86,9 @@ impl Database {
             if !user_profile_columns.iter().any(|column| column == "github_cdn_base_url") {
                 connection.execute_batch("ALTER TABLE user_profiles ADD COLUMN github_cdn_base_url TEXT;")?;
             }
+            if !user_profile_columns.iter().any(|column| column == "github_token_fallback") {
+                connection.execute_batch(include_str!("../../migrations/0007_profile_github_token_fallback.sql"))?;
+            }
             let parsed_paper_artifact_columns = table_columns(connection, "parsed_paper_artifacts")?;
             if !parsed_paper_artifact_columns.iter().any(|column| column == "figure_count") {
                 connection.execute_batch(

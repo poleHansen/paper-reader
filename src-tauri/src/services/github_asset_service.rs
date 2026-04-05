@@ -1,7 +1,6 @@
 use std::{path::Path, sync::Arc};
 
 use base64::Engine;
-use keyring::Entry;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -20,6 +19,16 @@ pub struct GitHubUploadResult {
     pub repository_path: String,
 }
 
+pub struct GitHubConfigStatus {
+    pub missing_fields: Vec<&'static str>,
+}
+
+impl GitHubConfigStatus {
+    pub fn is_configured(&self) -> bool {
+        self.missing_fields.is_empty()
+    }
+}
+
 impl GitHubAssetService {
     pub fn new(database: Arc<Database>) -> Self {
         Self {
@@ -28,11 +37,23 @@ impl GitHubAssetService {
         }
     }
 
-    pub fn is_configured(&self) -> Result<bool, AppError> {
+    pub fn config_status(&self) -> Result<GitHubConfigStatus, AppError> {
         let profile = self.profile_repository.get()?;
-        Ok(profile.github_repo_owner.as_deref().is_some_and(|value| !value.trim().is_empty())
-            && profile.github_repo_name.as_deref().is_some_and(|value| !value.trim().is_empty())
-            && profile.has_github_token)
+        let mut missing_fields = Vec::new();
+        if !profile.github_repo_owner.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+            missing_fields.push("repo owner");
+        }
+        if !profile.github_repo_name.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+            missing_fields.push("repo name");
+        }
+        if !profile.github_token.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+            missing_fields.push("token");
+        }
+        Ok(GitHubConfigStatus { missing_fields })
+    }
+
+    pub fn is_configured(&self) -> Result<bool, AppError> {
+        Ok(self.config_status()?.is_configured())
     }
 
     pub async fn upload_image(&self, image_path: &str, purpose: &str) -> Result<GitHubUploadResult, AppError> {
@@ -55,10 +76,12 @@ impl GitHubAssetService {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("main");
-        let token = Entry::new("paper-reader-profile", "local-user-github-token")
-            .map_err(|error| AppError::Internal(error.to_string()))?
-            .get_password()
-            .map_err(|error| AppError::Internal(error.to_string()))?;
+        let token = profile
+            .github_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AppError::Validation("github token is not configured".into()))?;
 
         let bytes = tokio::fs::read(image_path)
             .await

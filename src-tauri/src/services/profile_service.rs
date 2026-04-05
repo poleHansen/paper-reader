@@ -43,8 +43,12 @@ impl ProfileService {
     }
 
     pub async fn test_github_upload(&self) -> Result<GitHubUploadTestResponse, AppError> {
-        if !self.github_asset_service.is_configured()? {
-            return Err(AppError::Validation("github image hosting is not fully configured".into()));
+        let config_status = self.github_asset_service.config_status()?;
+        if !config_status.is_configured() {
+            return Err(AppError::Validation(format!(
+                "github image hosting is not fully configured; missing: {}",
+                config_status.missing_fields.join(", ")
+            )));
         }
 
         let temp_path = write_test_image().await?;

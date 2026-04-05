@@ -81,10 +81,12 @@ export function App() {
   const [libraryItems, setLibraryItems] = useState<LibraryItem[]>([]);
   const [profile, setProfile] = useState<UserProfile>(defaultProfile);
   const [statusText, setStatusText] = useState('Ready');
+  const [isTestingGitHubUpload, setIsTestingGitHubUpload] = useState(false);
   const [modelStatus, setModelStatus] = useState<ModelConnectionResult | null>(null);
   const [savedModels, setSavedModels] = useState<ModelConfigResponse[]>([]);
   const [selectedModelId, setSelectedModelId] = useState('');
   const [showApiKey, setShowApiKey] = useState(false);
+  const [showGithubToken, setShowGithubToken] = useState(false);
   const [modelDraft, setModelDraft] = useState<ModelConfigRequest>({
     displayName: 'Default OpenAI-compatible',
     provider: 'openai_compatible',
@@ -116,10 +118,11 @@ export function App() {
   const libraryHighlights = libraryItems.slice(0, 3);
   const workflowSteps = buildWorkflowSteps(readerSnapshot?.workflowCurrentStep ?? null);
   const effectiveGithubBranch = profile.githubRepoBranch?.trim() || 'main';
+  const hasGithubTokenValue = Boolean(profile.githubToken?.trim() || profile.hasGithubToken);
   const githubHostingReady = Boolean(
     profile.githubRepoOwner?.trim()
     && profile.githubRepoName?.trim()
-    && profile.hasGithubToken,
+    && hasGithubTokenValue,
   );
   const modelNeedsGithubHosting = modelDraft.imageInputFormat === 'url_required'
     || modelStatus?.imageInputWorkingFormat === 'url_required';
@@ -172,7 +175,7 @@ export function App() {
   async function loadProfile() {
     try {
       const saved = await getProfile();
-      setProfile({ ...saved, githubToken: null });
+      setProfile(saved);
       setHasProfile(true);
     } catch (error) {
       if (isNotFoundError(error)) {
@@ -207,7 +210,11 @@ export function App() {
   async function handleSaveProfile() {
     try {
       const saved = await upsertProfile(profile);
-      setProfile({ ...saved, githubToken: null });
+      setProfile((current) => ({
+        ...saved,
+        githubToken: saved.githubToken ?? current.githubToken,
+        hasGithubToken: saved.hasGithubToken ?? Boolean(saved.githubToken ?? current.githubToken?.trim()),
+      }));
       setHasProfile(true);
       setActiveView('search');
       setStatusText('Profile saved');
@@ -221,16 +228,20 @@ export function App() {
       setStatusText('GitHub upload test requires repo owner and repo name in User Profile');
       return;
     }
-    if (!profile.hasGithubToken && !profile.githubToken?.trim()) {
+    if (!hasGithubTokenValue) {
       setStatusText('GitHub upload test requires a saved GitHub token. Enter a token and click Save profile first.');
       return;
     }
 
     try {
+      setIsTestingGitHubUpload(true);
+      setStatusText('Testing GitHub upload by sending a small PNG to the configured repository...');
       const result = await testGitHubUpload();
       setStatusText(`GitHub upload test succeeded: ${result.repositoryPath} -> ${result.publicUrl}`);
     } catch (error) {
       setStatusText(formatError(error));
+    } finally {
+      setIsTestingGitHubUpload(false);
     }
   }
 
@@ -693,7 +704,17 @@ export function App() {
               <input value={profile.githubRepoBranch ?? ''} onChange={(event) => setProfile({ ...profile, githubRepoBranch: event.target.value || null })} placeholder="github branch" />
               <input value={profile.githubRepoPathPrefix ?? ''} onChange={(event) => setProfile({ ...profile, githubRepoPathPrefix: event.target.value || null })} placeholder="github path prefix (optional)" />
               <input value={profile.githubCdnBaseUrl ?? ''} onChange={(event) => setProfile({ ...profile, githubCdnBaseUrl: event.target.value || null })} placeholder="github cdn/raw base url (optional)" />
-              <input type="password" value={profile.githubToken ?? ''} onChange={(event) => setProfile({ ...profile, githubToken: event.target.value || null })} placeholder={profile.hasGithubToken ? 'github token already saved; enter to replace' : 'github token'} />
+              <div className="row rowWrap">
+                <input
+                  type={showGithubToken ? 'text' : 'password'}
+                  value={profile.githubToken ?? ''}
+                  onChange={(event) => setProfile({ ...profile, githubToken: event.target.value || null })}
+                  placeholder={hasGithubTokenValue ? 'github token already saved; enter to replace' : 'github token'}
+                />
+                <button className="secondaryButton" type="button" onClick={() => setShowGithubToken((value) => !value)}>
+                  {showGithubToken ? 'Hide token' : 'Show token'}
+                </button>
+              </div>
             </div>
             <div className={githubHostingReady ? 'noticeCard noticeCardSuccess' : 'noticeCard'}>
               <strong>GitHub image hosting</strong>
@@ -707,8 +728,8 @@ export function App() {
               {profile.githubCdnBaseUrl ? <span>CDN base: {profile.githubCdnBaseUrl}</span> : null}
             </div>
             <div className="row rowEnd rowWrap">
-              <button className="secondaryButton" onClick={() => void handleTestGitHubUpload()}>
-                Test GitHub upload
+              <button className="secondaryButton" onClick={() => void handleTestGitHubUpload()} disabled={isTestingGitHubUpload}>
+                {isTestingGitHubUpload ? 'Testing GitHub upload...' : 'Test GitHub upload'}
               </button>
               <button onClick={() => void handleSaveProfile()}>Save profile</button>
             </div>

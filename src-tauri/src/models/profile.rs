@@ -32,6 +32,7 @@ pub struct ProfileResponse {
     pub github_repo_branch: Option<String>,
     pub github_repo_path_prefix: Option<String>,
     pub github_cdn_base_url: Option<String>,
+    pub github_token: Option<String>,
     pub has_github_token: bool,
     pub updated_at: String,
 }

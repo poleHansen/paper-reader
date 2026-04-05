@@ -64,7 +64,21 @@ export async function getProfile(): Promise<UserProfile> {
 }
 
 export async function upsertProfile(payload: UserProfile): Promise<UserProfile> {
-  const response = await invoke('upsert_profile', { request: payload });
+  const request = {
+    role: payload.role,
+    researchField: payload.researchField,
+    focusTopic: payload.focusTopic,
+    readingGoal: payload.readingGoal,
+    outputLanguage: payload.outputLanguage,
+    experienceLevel: payload.experienceLevel,
+    githubRepoOwner: payload.githubRepoOwner,
+    githubRepoName: payload.githubRepoName,
+    githubRepoBranch: payload.githubRepoBranch,
+    githubRepoPathPrefix: payload.githubRepoPathPrefix,
+    githubCdnBaseUrl: payload.githubCdnBaseUrl,
+    githubToken: payload.githubToken,
+  };
+  const response = await invoke('upsert_profile', { request });
   return profileResponseSchema.parse(response);
 }
 

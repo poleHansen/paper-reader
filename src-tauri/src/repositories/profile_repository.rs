@@ -17,14 +17,13 @@ impl ProfileRepository {
     pub fn get(&self) -> Result<ProfileResponse, AppError> {
         self.database.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT id, role, research_field, focus_topic, reading_goal, output_language, experience_level, github_repo_owner, github_repo_name, github_repo_branch, github_repo_path_prefix, github_cdn_base_url, updated_at
+                "SELECT id, role, research_field, focus_topic, reading_goal, output_language, experience_level, github_repo_owner, github_repo_name, github_repo_branch, github_repo_path_prefix, github_cdn_base_url, github_token_fallback, updated_at
                  FROM user_profiles WHERE user_id = 'local-user'",
             )?;
             let response = statement.query_row([], |row| {
-                let has_github_token = Entry::new("paper-reader-profile", "local-user-github-token")
-                    .ok()
-                    .and_then(|entry| entry.get_password().ok())
-                    .is_some();
+                let github_token_fallback: Option<String> = row.get(12)?;
+                let github_token = load_github_token(github_token_fallback);
+                let has_github_token = github_token.as_deref().is_some_and(|value| !value.trim().is_empty());
                 Ok(ProfileResponse {
                     id: row.get(0)?,
                     role: row.get(1)?,
@@ -38,8 +37,9 @@ impl ProfileRepository {
                     github_repo_branch: row.get(9)?,
                     github_repo_path_prefix: row.get(10)?,
                     github_cdn_base_url: row.get(11)?,
+                    github_token,
                     has_github_token,
-                    updated_at: row.get(12)?,
+                    updated_at: row.get(13)?,
                 })
             });
 
@@ -54,11 +54,12 @@ impl ProfileRepository {
     pub fn upsert(&self, request: UpsertProfileRequest) -> Result<ProfileResponse, AppError> {
         let id = Uuid::new_v4().to_string();
         let updated_at = now_iso();
+        let github_token = request.github_token.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()).map(str::to_string);
 
         self.database.with_connection(|connection| {
             connection.execute(
-                "INSERT INTO user_profiles (id, user_id, role, research_field, focus_topic, reading_goal, output_language, experience_level, github_repo_owner, github_repo_name, github_repo_branch, github_repo_path_prefix, github_cdn_base_url, updated_at)
-                 VALUES (?1, 'local-user', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                "INSERT INTO user_profiles (id, user_id, role, research_field, focus_topic, reading_goal, output_language, experience_level, github_repo_owner, github_repo_name, github_repo_branch, github_repo_path_prefix, github_cdn_base_url, github_token_fallback, updated_at)
+                 VALUES (?1, 'local-user', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                  ON CONFLICT(user_id) DO UPDATE SET
                     role = excluded.role,
                     research_field = excluded.research_field,
@@ -71,6 +72,7 @@ impl ProfileRepository {
                     github_repo_branch = excluded.github_repo_branch,
                     github_repo_path_prefix = excluded.github_repo_path_prefix,
                     github_cdn_base_url = excluded.github_cdn_base_url,
+                    github_token_fallback = COALESCE(excluded.github_token_fallback, github_token_fallback),
                     updated_at = excluded.updated_at",
                 rusqlite::params![
                     id,
@@ -85,11 +87,12 @@ impl ProfileRepository {
                     request.github_repo_branch,
                     request.github_repo_path_prefix,
                     request.github_cdn_base_url,
+                    github_token,
                     updated_at,
                 ],
             )?;
 
-            if let Some(token) = request.github_token.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()) {
+            if let Some(token) = github_token.as_deref() {
                 let entry = Entry::new("paper-reader-profile", "local-user-github-token")
                     .map_err(|error| AppError::Internal(error.to_string()))?;
                 entry
@@ -98,14 +101,13 @@ impl ProfileRepository {
             }
 
             let mut statement = connection.prepare(
-                "SELECT id, role, research_field, focus_topic, reading_goal, output_language, experience_level, github_repo_owner, github_repo_name, github_repo_branch, github_repo_path_prefix, github_cdn_base_url, updated_at
+                "SELECT id, role, research_field, focus_topic, reading_goal, output_language, experience_level, github_repo_owner, github_repo_name, github_repo_branch, github_repo_path_prefix, github_cdn_base_url, github_token_fallback, updated_at
                  FROM user_profiles WHERE user_id = 'local-user'",
             )?;
             let response = statement.query_row([], |row| {
-                let has_github_token = Entry::new("paper-reader-profile", "local-user-github-token")
-                    .ok()
-                    .and_then(|entry| entry.get_password().ok())
-                    .is_some();
+                let github_token_fallback: Option<String> = row.get(12)?;
+                let github_token = load_github_token(github_token_fallback);
+                let has_github_token = github_token.as_deref().is_some_and(|value| !value.trim().is_empty());
                 Ok(ProfileResponse {
                     id: row.get(0)?,
                     role: row.get(1)?,
@@ -119,11 +121,20 @@ impl ProfileRepository {
                     github_repo_branch: row.get(9)?,
                     github_repo_path_prefix: row.get(10)?,
                     github_cdn_base_url: row.get(11)?,
+                    github_token,
                     has_github_token,
-                    updated_at: row.get(12)?,
+                    updated_at: row.get(13)?,
                 })
             })?;
             Ok(response)
         })
     }
+}
+
+fn load_github_token(fallback: Option<String>) -> Option<String> {
+    Entry::new("paper-reader-profile", "local-user-github-token")
+        .ok()
+        .and_then(|entry| entry.get_password().ok())
+        .or(fallback)
+        .filter(|value| !value.trim().is_empty())
 }
