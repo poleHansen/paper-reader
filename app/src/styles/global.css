@@ -183,6 +183,14 @@ select {
   min-height: 0;
 }
 
+.modelPageScroll {
+  min-height: 0;
+  height: calc(100vh - 4rem);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 0.35rem;
+}
+
 .pageCardReader {
   min-height: calc(100vh - 4rem);
   grid-template-rows: auto minmax(0, 1fr);
@@ -247,6 +255,28 @@ select {
   border: 1px solid rgba(30, 25, 20, 0.12);
 }
 
+.buttonWithSpinner {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.55rem;
+}
+
+.buttonSpinner {
+  width: 0.9rem;
+  height: 0.9rem;
+  border-radius: 999px;
+  border: 2px solid rgba(30, 25, 20, 0.2);
+  border-top-color: currentColor;
+  animation: button-spin 0.75s linear infinite;
+}
+
+@keyframes button-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .list {
   display: grid;
   gap: 0.75rem;
@@ -254,7 +284,8 @@ select {
   min-height: 0;
 }
 
-.libraryListScroll {
+.libraryListScroll,
+.searchResultsScroll {
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -263,7 +294,8 @@ select {
   scrollbar-width: none;
 }
 
-.libraryListScroll::-webkit-scrollbar {
+.libraryListScroll::-webkit-scrollbar,
+.searchResultsScroll::-webkit-scrollbar {
   width: 0;
   height: 0;
 }
@@ -608,7 +640,8 @@ select {
 .readerDocumentViewport,
 .readerAgentBody,
 .uploadPageScroll,
-.readerPanelScrollable {
+.readerPanelScrollable,
+.modelPageScroll {
   -ms-overflow-style: none;
   scrollbar-width: none;
 }
@@ -617,7 +650,8 @@ select {
 .readerDocumentViewport::-webkit-scrollbar,
 .readerAgentBody::-webkit-scrollbar,
 .uploadPageScroll::-webkit-scrollbar,
-.readerPanelScrollable::-webkit-scrollbar {
+.readerPanelScrollable::-webkit-scrollbar,
+.modelPageScroll::-webkit-scrollbar {
   width: 0;
   height: 0;
 }

@@ -720,7 +720,7 @@ impl RuntimeRepository {
 
         while !stage_state.enough && stage_state.iteration < stage_state.max_iterations {
             let candidate_targets = list_candidate_targets(&run_context.parsed_content, &run_context.context_plan, &stage_state);
-            let (decision, decision_completion) = request_runtime_decision(
+            let (mut decision, decision_completion) = request_runtime_decision(
                 model_config,
                 agent_type,
                 &run_context.prompt,
@@ -736,6 +736,14 @@ impl RuntimeRepository {
                 None => decision_completion,
             });
 
+            if decision.action == "finish" && !can_finalize_stage(&stage_state, latest_output.as_ref()) {
+                decision.action = "blocked".to_string();
+                decision.reason = format!(
+                    "Finish was rejected because required checks remain incomplete or the stage output is not ready. Original reason: {}",
+                    decision.reason
+                );
+            }
+
             if decision.action == "finish" || decision.action == "blocked" {
                 let final_prompt = build_finish_final_output_prompt(
                     &run_context.prompt,
@@ -747,9 +755,6 @@ impl RuntimeRepository {
                 );
                 let (output, final_completion) = request_final_output(model_config, agent_type, &final_prompt).await?;
                 stage_state = apply_decision_to_stage_state(stage_state, &decision, None, Some(&output.output_json));
-                if decision.action == "blocked" {
-                    stage_state.enough = true;
-                }
                 self.update_stage_state_snapshot(run_id, &stage_state)?;
 
                 let final_completion = match aggregate_completion.take() {
@@ -826,22 +831,23 @@ impl RuntimeRepository {
             });
         }
 
+        let max_iteration_decision = DecisionEnvelope {
+            action: "blocked".to_string(),
+            target: None,
+            reason: "Reached max iterations before the required checks or output schema were complete.".to_string(),
+            check_status: Vec::new(),
+            open_questions: stage_state.open_questions.clone(),
+        };
         let final_prompt = build_finish_final_output_prompt(
             &run_context.prompt,
             agent_type,
             &stage_state,
             latest_output.as_ref(),
             &action_history,
-            &DecisionEnvelope {
-                action: "finish".to_string(),
-                target: None,
-                reason: "Reached max iterations; finalize using collected evidence.".to_string(),
-                check_status: Vec::new(),
-                open_questions: stage_state.open_questions.clone(),
-            },
+            &max_iteration_decision,
         );
         let (output, final_completion) = request_final_output(model_config, agent_type, &final_prompt).await?;
-        stage_state.enough = true;
+        stage_state = apply_decision_to_stage_state(stage_state, &max_iteration_decision, None, Some(&output.output_json));
         self.update_stage_state_snapshot(run_id, &stage_state)?;
         let final_completion = match aggregate_completion.take() {
             Some(previous) => merge_usage(previous, final_completion),
@@ -1495,10 +1501,10 @@ fn build_prompt(
 
 fn schema_prompt_requirement(agent_type: &str) -> String {
     match agent_type {
-        "quick_read" => "- Required top-level fields for quick_read: summary, evidence, readingRecommendation, priorityDecision, priorityReason, recommendation.\n- readingRecommendation must be one of: worth_deep_read, worth_skimming_or_save, not_recommended.\n- priorityDecision must be one of: 值得精读, 值得略读/暂存, 不建议继续读.\n- recommendation must be one of: continue, skip, uncertain.\n- Also include decisionReason and fiveCs when possible; do not rename these fields or nest them under another object.".into(),
-        "careful_read" => "- Required top-level fields for careful_read: summary, evidence, mainThreadSummary, limitations, finalAdvice.\n- finalAdvice must include oneSentenceValue, bestToLearn, mostNeedCaution, nextDecision.\n- finalAdvice.nextDecision must be one of: continue_deep_dive, reference_only, set_aside.".into(),
-        "deep_read" => "- Required top-level fields for deep_read: summary, evidence, noveltyAssessment, coreResultSummary, limitations, finalSummary.\n- finalSummary must include mostWorthLearning, mostWorthQuestioning, researchValueForUser, nextThreeActions.".into(),
-        "summary" => "- Required top-level fields for summary: shortSummary, longSummary, presentationSummary, keyTakeaways, recommendedTags.\n- recommendedTags must only use: needs_deep_read, need_followup_references, background_citation.".into(),
+        "quick_read" => "- Required top-level fields for quick_read: summary, evidence, conclusion, reasons, keyInformation, readingRecommendation, priorityDecision, priorityReason, recommendation.\n- conclusion must be a concise screening judgment.\n- reasons must be a non-empty string array explaining relevance, quality, method/result signal, and research value.\n- keyInformation must be an object with problem, method, result, innovation, evidenceSupport, researchValue.\n- readingRecommendation must be one of: worth_deep_read, worth_skimming_or_save, not_recommended.\n- priorityDecision must be one of: 值得精读, 值得略读/暂存, 不建议继续读.\n- recommendation must be one of: continue, skip, uncertain.".into(),
+        "careful_read" => "- Required top-level fields for careful_read: summary, evidence, mainlineSummary, methodLogic, experimentAndResults, innovationAndLimitations, valueForMe.\n- mainlineSummary must explain the problem, why it matters, and why prior work was insufficient.\n- methodLogic must be an object with coreIdea, keyModules, assumptions, applicableConditions.\n- experimentAndResults must be an object with experimentDesign, keyFiguresOrTables, importantResults.\n- innovationAndLimitations must be an object with innovations, limitations.\n- valueForMe must be an object with researchValue, followupReferences, recommendation.".into(),
+        "deep_read" => "- Required top-level fields for deep_read: summary, evidence, coreHypothesis, keyDetails, authorPathReconstruction, criticalQuestions, reusableContent, futureDirections.\n- keyDetails must be an object with methodDetails, experimentDetails, conclusionSupport.\n- authorPathReconstruction must explain the research path and logic.\n- criticalQuestions must be an array of the most questionable points.\n- reusableContent must be an object with reusableIdeas, reusableMethods, usableCitations.\n- futureDirections must be an object with newResearchQuestions, followupLiteratureDirections.".into(),
+        "summary" => "- Required top-level fields for summary: shortSummary, titleAndPublication, researchProblem, coreMethod, coreResults, valueForMe, recommendationTag.\n- titleAndPublication must be an object with title, authors, venue, year.\n- valueForMe must explain inspiration or practical value to the reader.\n- recommendationTag must be one of: needs_deep_read, need_followup_references, background_citation.".into(),
         _ => String::new(),
     }
 }
@@ -1688,26 +1694,26 @@ fn selection_reason_for_agent(
 
     match agent_type {
         "quick_read" => format!(
-            "Quick read targets anchor sections for fast relevance screening; {} section(s) selected{}.",
+            "Quick read prioritizes fast screening evidence for relevance, credibility, core problem-method-result, and whether the paper deserves deeper reading; {} section(s) selected{}.",
             section_count,
             fallback_suffix(fallback_applied)
         ),
         "careful_read" => {
             if fallback_applied {
                 format!(
-                    "Careful read started from {} quick-read handoff summary ids, but no explicit gaps resolved to paper sections, so the planner fell back to the first {} section(s).",
+                    "Careful read started from {} upstream handoff summary ids, but no precise gap-targeted sections were found, so the planner fell back to the first {} section(s) to recover the paper's problem, method logic, experiment evidence, and limitations.",
                     handoff_count,
                     section_count
                 )
             } else if section_count > 0 {
                 format!(
-                    "Careful read is handoff-first: {} summary ids narrowed the plan to {} section(s) that backfill unresolved introduction, method, result, or limitation gaps.",
+                    "Careful read is handoff-first: {} summary ids narrowed the plan to {} section(s) that explain the research problem, method chain, experiment design, key figures/tables, innovation, and limitations.",
                     handoff_count,
                     section_count
                 )
             } else {
                 format!(
-                    "Careful read is relying on {} handoff summary ids without section backfill because the current handoff already covers the remaining gaps.",
+                    "Careful read is relying on {} handoff summary ids without section backfill because the current handoff already covers the needed problem-method-result-limitation chain.",
                     handoff_count
                 )
             }
@@ -1715,13 +1721,13 @@ fn selection_reason_for_agent(
         "deep_read" => {
             if fallback_applied {
                 format!(
-                    "Deep read used {} handoff summary ids, but no evidence-linked section match was found, so the planner fell back to the first {} section(s).",
+                    "Deep read used {} handoff summary ids, but no high-value evidence-linked section match was found, so the planner fell back to the first {} section(s) to reconstruct method details, experiment logic, conclusion reliability, and reusable ideas.",
                     handoff_count,
                     section_count
                 )
             } else {
                 format!(
-                    "Deep read used {} handoff summary ids to target {} section(s) referenced by carry-forward questions or evidence{}.",
+                    "Deep read used {} handoff summary ids to target {} section(s) referenced by carry-forward questions or evidence so it can reconstruct the author path, inspect critical details, challenge weak points, and extract reusable research ideas{}.",
                     handoff_count,
                     section_count,
                     if handoff_count == 0 { " from the paper structure alone" } else { "" }
@@ -1731,17 +1737,17 @@ fn selection_reason_for_agent(
         "summary" => {
             if handoff_only {
                 format!(
-                    "Summary is handoff-only: {} summary ids provide a complete synthesis chain, so no paper sections were backfilled.",
+                    "Summary is handoff-only: {} summary ids already provide the synthesis chain for final title-publication-problem-method-result-value tagging, so no paper sections were backfilled.",
                     handoff_count
                 )
             } else if fallback_applied {
                 format!(
-                    "Summary could not build a complete handoff chain, so it fell back to {} anchor section(s) from the paper.",
+                    "Summary could not build a complete handoff chain, so it fell back to {} anchor section(s) from the paper to complete the final synthesis.",
                     section_count
                 )
             } else {
                 format!(
-                    "Summary used {} handoff summary ids and backfilled {} anchor section(s) because the handoff chain was incomplete.",
+                    "Summary used {} handoff summary ids and backfilled {} anchor section(s) because the handoff chain was incomplete for final synthesis.",
                     handoff_count,
                     section_count
                 )
@@ -1860,13 +1866,14 @@ fn keywords_for_agent(agent_type: &str, selected_handoff_summaries: &[Value]) ->
             "abstract",
             "introduction",
             "intro",
+            "motivation",
             "method",
             "approach",
             "framework",
             "experiment",
             "evaluation",
-            "ablation",
             "result",
+            "discussion",
             "conclusion",
         ]
         .into_iter()
@@ -1875,22 +1882,46 @@ fn keywords_for_agent(agent_type: &str, selected_handoff_summaries: &[Value]) ->
         "careful_read" => {
             let mut keywords = extract_careful_read_keywords(selected_handoff_summaries);
             keywords.extend(
-                ["introduction", "method", "approach", "experiment", "evaluation", "limitation", "discussion"]
-                    .into_iter()
-                    .map(str::to_string),
+                [
+                    "introduction",
+                    "background",
+                    "method",
+                    "approach",
+                    "implementation",
+                    "experiment",
+                    "evaluation",
+                    "result",
+                    "discussion",
+                    "limitation",
+                    "conclusion",
+                ]
+                .into_iter()
+                .map(str::to_string),
             );
             dedupe_strings(keywords)
         }
         "deep_read" => {
             let mut keywords = extract_deep_read_keywords(selected_handoff_summaries);
             keywords.extend(
-                ["method", "implementation", "experiment", "appendix", "ablation", "discussion"]
-                    .into_iter()
-                    .map(str::to_string),
+                [
+                    "method",
+                    "implementation",
+                    "algorithm",
+                    "training",
+                    "experiment",
+                    "evaluation",
+                    "ablation",
+                    "analysis",
+                    "discussion",
+                    "appendix",
+                    "supplementary",
+                ]
+                .into_iter()
+                .map(str::to_string),
             );
             dedupe_strings(keywords)
         }
-        "summary" => vec!["abstract", "conclusion", "discussion", "result"]
+        "summary" => vec!["abstract", "introduction", "result", "discussion", "conclusion"]
             .into_iter()
             .map(str::to_string)
             .collect(),
@@ -2479,10 +2510,10 @@ fn inject_stage_state_into_output(mut output: Value, stage_state: &StageState) -
 fn build_initial_stage_state(agent_type: &str, context_plan: &ContextPlan, handoff_summaries: &[Value]) -> StageState {
     let stage = agent_type.to_string();
     let goal = match agent_type {
-        "quick_read" => "Determine whether the paper is worth deeper reading based on high-signal evidence.",
-        "careful_read" => "Close the main method, result, and limitation gaps needed for a careful reading judgment.",
-        "deep_read" => "Validate novelty, core results, and caveats with targeted evidence collection.",
-        "summary" => "Produce a reliable final synthesis from the collected handoff chain and targeted evidence.",
+        "quick_read" => "Answer whether this paper is worth continuing to read by judging relevance, credibility, problem-method-result clarity, experimental support, and research value from high-signal evidence.",
+        "careful_read" => "Explain the paper's main line clearly: what problem it solves, why it matters, what method it uses, how the experiments support it, what the innovations and limitations are, and what value it has for the reader.",
+        "deep_read" => "Reconstruct the paper at detail level: unpack method and experiment details, rebuild the author reasoning path, stress-test reliability, and extract reusable ideas, follow-up questions, and future directions.",
+        "summary" => "Produce a compact final synthesis covering title/publication info, research problem, core method, core results, value to the reader, and a final reading/reference/citation tag.",
         _ => "Collect enough evidence to complete the current reading stage.",
     }
     .to_string();
@@ -2504,8 +2535,8 @@ fn build_initial_stage_state(agent_type: &str, context_plan: &ContextPlan, hando
 
 fn allowed_actions_for_agent(agent_type: &str) -> Vec<String> {
     match agent_type {
-        "summary" => vec!["read_section", "search_text", "get_figure", "get_table", "finish", "blocked"],
-        _ => vec![
+        "quick_read" => vec!["read_section", "search_text", "get_figure", "get_table", "finish", "blocked"],
+        "careful_read" => vec![
             "read_section",
             "search_text",
             "get_figure",
@@ -2514,6 +2545,17 @@ fn allowed_actions_for_agent(agent_type: &str) -> Vec<String> {
             "finish",
             "blocked",
         ],
+        "deep_read" => vec![
+            "read_section",
+            "search_text",
+            "get_figure",
+            "analyze_figure",
+            "get_table",
+            "finish",
+            "blocked",
+        ],
+        "summary" => vec!["read_section", "search_text", "get_figure", "get_table", "finish", "blocked"],
+        _ => vec!["read_section", "search_text", "finish", "blocked"],
     }
     .into_iter()
     .map(str::to_string)
@@ -2523,22 +2565,26 @@ fn allowed_actions_for_agent(agent_type: &str) -> Vec<String> {
 fn build_stage_checks(agent_type: &str, context_plan: &ContextPlan, handoff_summaries: &[Value]) -> Vec<StageCheckItem> {
     let mut checks = match agent_type {
         "quick_read" => vec![
-            stage_check("anchor_sections", "Anchor sections reviewed"),
-            stage_check("value_judgment", "Value judgment supported by evidence"),
+            stage_check("relevance_and_quality", "Relevance and trustworthiness judged"),
+            stage_check("problem_method_result", "Problem, method, and result chain identified"),
+            stage_check("evidence_support", "Experiments, figures, or tables checked for conclusion support"),
+            stage_check("reading_decision", "Continue/skim/stop decision supported by evidence"),
         ],
         "careful_read" => vec![
-            stage_check("method_evidence", "Method evidence reviewed"),
-            stage_check("results_evidence", "Results evidence reviewed"),
-            stage_check("limitations", "Limitations or risks identified"),
+            stage_check("problem_and_motivation", "Core problem and why it matters explained"),
+            stage_check("method_logic", "Method logic, modules, assumptions, and conditions explained"),
+            stage_check("experiment_and_results", "Experiments, key figures/tables, and important results explained"),
+            stage_check("innovation_limitations_value", "Innovation, limitations, and value to the reader explained"),
         ],
         "deep_read" => vec![
-            stage_check("novelty", "Novelty claim checked"),
-            stage_check("core_results", "Core results verified"),
-            stage_check("caveats", "Main caveats identified"),
+            stage_check("method_and_experiment_details", "Method and experiment details decomposed"),
+            stage_check("author_reasoning_path", "Author research path reconstructed"),
+            stage_check("critical_reliability_review", "Most questionable points and reliability reviewed"),
+            stage_check("reusable_output", "Reusable ideas, new questions, and follow-up directions extracted"),
         ],
         "summary" => vec![
             stage_check("handoff_chain", "Handoff chain is sufficient"),
-            stage_check("final_synthesis", "Final synthesis has enough support"),
+            stage_check("final_summary_fields", "Final compact summary fields are fully supported"),
         ],
         _ => vec![stage_check("evidence", "Sufficient evidence collected")],
     };
@@ -2574,10 +2620,21 @@ fn stage_check(id: &str, label: &str) -> StageCheckItem {
 
 fn initial_open_questions(agent_type: &str) -> Vec<String> {
     match agent_type {
-        "quick_read" => vec!["Which section best justifies the continue/skip decision?".to_string()],
-        "careful_read" => vec!["Which unresolved method or evaluation detail still matters most?".to_string()],
-        "deep_read" => vec!["Which novelty or validity claim still lacks direct support?".to_string()],
-        "summary" => vec!["Is the current synthesis fully supported by the handoff chain and evidence?".to_string()],
+        "quick_read" => vec![
+            "What is the paper trying to solve, how does it solve it, and is that enough to justify continued reading?".to_string(),
+            "Do the visible experimental signals, figures, or tables actually support the claimed value?".to_string(),
+        ],
+        "careful_read" => vec![
+            "What is the paper's full main line from problem to method to evidence to conclusion?".to_string(),
+            "Which method detail, experiment result, innovation claim, or limitation still needs clarification?".to_string(),
+        ],
+        "deep_read" => vec![
+            "Which method or experiment detail is most important to reconstruct the author's reasoning path?".to_string(),
+            "What is the weakest link in the paper's logic, and what reusable idea can still be extracted?".to_string(),
+        ],
+        "summary" => vec![
+            "Is the final compact synthesis fully supported for problem, method, result, value, and final tag?".to_string(),
+        ],
         _ => Vec::new(),
     }
 }
@@ -2654,7 +2711,7 @@ fn build_next_action_decision_prompt(
     candidate_targets: &Value,
 ) -> String {
     format!(
-        "{base_prompt}\n\nDecision step for agent {agent_type}:\n- Return strict JSON only matching {{\"action\": string, \"target\": string|null, \"reason\": string, \"checkStatus\": [{{\"id\": string, \"status\": string}}], \"openQuestions\": string[]}}.\n- Choose exactly one action from the allowed actions in stageState.\n- Use action=finish only when the required checks are complete or enough=true.\n- Use action=blocked only when no productive next action exists.\n- Do not generate the final schema in this step.\n\nCurrent stageState:\n{stage_state}\n\nLatest output snapshot:\n{latest_output}\n\nAction history:\n{action_history}\n\nCandidate targets:\n{candidate_targets}",
+        "{base_prompt}\n\nDecision step for agent {agent_type}:\n- Return strict JSON only matching {{\"action\": string, \"target\": string|null, \"reason\": string, \"checkStatus\": [{{\"id\": string, \"status\": string}}], \"openQuestions\": string[]}}.\n- Choose exactly one action from the allowed actions in stageState.\n- Use checkStatus to mark progress against the current reading-stage questions in stageState.checks.\n- Prefer actions that reduce the most important open question first.\n- Use action=finish only when the required checks are complete or enough=true.\n- Use action=blocked only when no productive next action exists.\n- Do not generate the final schema in this step.\n\nCurrent stageState:\n{stage_state}\n\nLatest output snapshot:\n{latest_output}\n\nAction history:\n{action_history}\n\nCandidate targets:\n{candidate_targets}",
         stage_state = serde_json::to_string_pretty(stage_state).unwrap_or_else(|_| "{}".into()),
         latest_output = latest_output.cloned().unwrap_or(Value::Null),
         action_history = serde_json::to_string_pretty(action_history).unwrap_or_else(|_| "[]".into()),
@@ -2895,7 +2952,7 @@ fn build_final_output_generation_prompt(
     action_history: &[Value],
 ) -> String {
     format!(
-        "{base_prompt}\n\nAction execution and final-output generation step for agent {agent_type}:\n- You have already decided the next action.\n- Update the running output using the provided action payload and prior output.\n- Return strict JSON only matching the normal {agent_type} runtime schema.\n- Preserve previously established conclusions unless the new evidence changes them.\n\nCurrent stageState:\n{stage_state}\n\nDecision:\n{decision}\n\nResolved action payload:\n{payload}\n\nLatest output snapshot:\n{latest_output}\n\nAction history:\n{action_history}",
+        "{base_prompt}\n\nAction execution and final-output generation step for agent {agent_type}:\n- You have already decided the next action.\n- Update the running output using the provided action payload and prior output.\n- Return strict JSON only matching the normal {agent_type} runtime schema.\n- Keep the output aligned with the stage contract in stageState.goal and stageState.checks.\n- Preserve previously established conclusions unless the new evidence changes them.\n\nCurrent stageState:\n{stage_state}\n\nDecision:\n{decision}\n\nResolved action payload:\n{payload}\n\nLatest output snapshot:\n{latest_output}\n\nAction history:\n{action_history}",
         stage_state = serde_json::to_string_pretty(stage_state).unwrap_or_else(|_| "{}".into()),
         decision = serde_json::to_string_pretty(decision).unwrap_or_else(|_| "{}".into()),
         payload = serde_json::to_string_pretty(&resolved_action.payload).unwrap_or_else(|_| "{}".into()),
@@ -2913,7 +2970,7 @@ fn build_finish_final_output_prompt(
     decision: &DecisionEnvelope,
 ) -> String {
     format!(
-        "{base_prompt}\n\nFinish step for agent {agent_type}:\n- Do not read any new batch or new target.\n- Generate the final runtime schema directly from the existing evidence, latest output, action history, and stageState.\n- Return strict JSON only.\n- If the run is blocked, preserve uncertainty explicitly while still returning the required schema.\n\nCurrent stageState:\n{stage_state}\n\nFinish decision:\n{decision}\n\nLatest output snapshot:\n{latest_output}\n\nAction history:\n{action_history}",
+        "{base_prompt}\n\nFinish step for agent {agent_type}:\n- Do not read any new batch or new target.\n- Generate the final runtime schema directly from the existing evidence, latest output, action history, and stageState.\n- The final JSON must answer the stage goal explicitly, not just restate fragments of evidence.\n- Return strict JSON only.\n- If the run is blocked, preserve uncertainty explicitly while still returning the required schema.\n\nCurrent stageState:\n{stage_state}\n\nFinish decision:\n{decision}\n\nLatest output snapshot:\n{latest_output}\n\nAction history:\n{action_history}",
         stage_state = serde_json::to_string_pretty(stage_state).unwrap_or_else(|_| "{}".into()),
         decision = serde_json::to_string_pretty(decision).unwrap_or_else(|_| "{}".into()),
         latest_output = latest_output.cloned().unwrap_or(Value::Null),
@@ -3083,22 +3140,102 @@ fn apply_decision_to_stage_state(
 
     stage_state.open_questions = decision.open_questions.clone();
 
+    let can_finalize = output_json
+        .map(|value| can_finalize_stage(&stage_state, Some(value)))
+        .unwrap_or(false);
+
     if decision.action == "finish" {
+        stage_state.enough = can_finalize;
+    } else if decision.action == "blocked" {
+        stage_state.enough = false;
+    } else if can_finalize {
         stage_state.enough = true;
     }
 
-    if let Some(output_json) = output_json {
-        let has_summary = output_json
-            .get("summary")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty());
-        if has_summary && stage_state.checks.iter().all(|check| !check.required || check.status == "done") {
-            stage_state.enough = true;
-        }
-    }
-
     stage_state
+}
+
+fn can_finalize_stage(stage_state: &StageState, output_json: Option<&Value>) -> bool {
+    stage_checks_complete(stage_state)
+        && output_json
+            .map(|value| stage_output_ready(&stage_state.stage, value))
+            .unwrap_or(false)
+}
+
+fn stage_checks_complete(stage_state: &StageState) -> bool {
+    stage_state
+        .checks
+        .iter()
+        .all(|check| !check.required || check.status == "done")
+}
+
+fn stage_output_ready(agent_type: &str, output_json: &Value) -> bool {
+    let object = match output_json.as_object() {
+        Some(object) => object,
+        None => return false,
+    };
+
+    let summary_ready = object
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+
+    match agent_type {
+        "quick_read" => {
+            summary_ready
+                && non_empty_string(object, "conclusion")
+                && non_empty_string_array_field(object, "reasons")
+                && non_empty_string(object, "priorityReason")
+        }
+        "careful_read" => {
+            summary_ready
+                && non_empty_string(object, "mainlineSummary")
+                && non_empty_object_field(object, "methodLogic")
+                && non_empty_object_field(object, "experimentAndResults")
+                && non_empty_object_field(object, "innovationAndLimitations")
+                && non_empty_object_field(object, "valueForMe")
+        }
+        "deep_read" => {
+            summary_ready
+                && non_empty_string(object, "coreHypothesis")
+                && non_empty_object_field(object, "keyDetails")
+                && non_empty_string(object, "authorPathReconstruction")
+                && non_empty_string_array_field(object, "criticalQuestions")
+                && non_empty_object_field(object, "reusableContent")
+                && non_empty_object_field(object, "futureDirections")
+        }
+        "summary" => {
+            non_empty_string(object, "shortSummary")
+                && non_empty_object_field(object, "titleAndPublication")
+                && non_empty_string(object, "researchProblem")
+                && non_empty_string(object, "coreMethod")
+                && non_empty_string(object, "coreResults")
+                && non_empty_string(object, "valueForMe")
+                && non_empty_string(object, "recommendationTag")
+        }
+        _ => summary_ready,
+    }
+}
+
+fn non_empty_string(object: &serde_json::Map<String, Value>, key: &str) -> bool {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn non_empty_object_field(object: &serde_json::Map<String, Value>, key: &str) -> bool {
+    object.get(key).and_then(Value::as_object).is_some_and(|value| !value.is_empty())
+}
+
+fn non_empty_string_array_field(object: &serde_json::Map<String, Value>, key: &str) -> bool {
+    object.get(key).and_then(Value::as_array).is_some_and(|items| {
+        items.iter()
+            .filter_map(Value::as_str)
+            .any(|value| !value.trim().is_empty())
+    })
 }
 
 fn action_source_kind(action: &str) -> &'static str {
@@ -3216,13 +3353,13 @@ fn derive_agent_summary(
             .filter(|value| !value.trim().is_empty())
             .or_else(|| {
                 object
-                    .get("longSummary")
+                    .get("coreResults")
                     .and_then(Value::as_str)
                     .filter(|value| !value.trim().is_empty())
             })
             .or_else(|| {
                 object
-                    .get("presentationSummary")
+                    .get("valueForMe")
                     .and_then(Value::as_str)
                     .filter(|value| !value.trim().is_empty())
             })
@@ -3265,181 +3402,263 @@ fn synthesize_quick_read_fields(object: &mut serde_json::Map<String, Value>, sum
         .trim()
         .to_string();
     let priority_reason_short = truncate_text(&priority_reason_fallback, 220);
+    ensure_non_empty_string_field(object, "conclusion", &priority_reason_short);
     ensure_non_empty_string_field(object, "priorityReason", &priority_reason_short);
 
-    let decision_reason_fallback = object
-        .get("priorityReason")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(priority_reason_fallback.as_str())
-        .trim()
-        .to_string();
-    ensure_non_empty_string_field(object, "decisionReason", &decision_reason_fallback);
-
-    let five_cs = object
-        .entry("fiveCs")
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    if !five_cs.is_object() {
-        *five_cs = Value::Object(serde_json::Map::new());
+    if object
+        .get("reasons")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
+    {
+        object.insert(
+            "reasons".into(),
+            Value::Array(vec![
+                Value::String("The paper has enough visible signal on problem, method, or result to support a screening judgment.".into()),
+                Value::String(priority_reason_short.clone()),
+            ]),
+        );
     }
-    let five_cs_object = five_cs
+
+    let key_information = object
+        .entry("keyInformation")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !key_information.is_object() {
+        *key_information = Value::Object(serde_json::Map::new());
+    }
+    let key_information_object = key_information
         .as_object_mut()
-        .expect("fiveCs should be an object after normalization");
-    ensure_non_empty_string_field(five_cs_object, "category", "The paper appears to be a method-focused empirical research paper.");
-    ensure_non_empty_string_field(five_cs_object, "context", "Judge it by problem importance, method clarity, and whether visible evidence supports continued reading.");
-    ensure_non_empty_string_field(five_cs_object, "correctness", "Treat the current judgment as provisional until the main results, setup, and assumptions are checked more fully.");
-    ensure_non_empty_string_field(five_cs_object, "contributions", &priority_reason_short);
-    ensure_non_empty_string_field(five_cs_object, "clarity", "The value judgment should stay concise and explicitly tied to visible claims, method framing, and result signals.");
+        .expect("keyInformation should be an object after normalization");
+    ensure_non_empty_string_field(key_information_object, "problem", "The paper addresses a concrete research problem that should be judged by importance and relevance.");
+    ensure_non_empty_string_field(key_information_object, "method", "The paper proposes a method or framework whose core idea should be screened for clarity.");
+    ensure_non_empty_string_field(key_information_object, "result", &priority_reason_short);
+    ensure_non_empty_string_field(key_information_object, "innovation", "The paper appears to claim a potentially useful contribution, but it still needs deeper verification.");
+    ensure_non_empty_string_field(key_information_object, "evidenceSupport", "Use visible experiments, figures, or tables to judge whether the conclusion is supported.");
+    ensure_non_empty_string_field(key_information_object, "researchValue", "Judge whether the paper is worth deep reading, worth skimming/saving, or should be dropped.");
 }
 
 fn synthesize_careful_read_fields(object: &mut serde_json::Map<String, Value>, summary: &str) {
-    if object
-        .get("mainThreadSummary")
+    let summary_fallback = object
+        .get("summary")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .is_none_or(|value| value.is_empty())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(summary)
+        .trim()
+        .to_string();
+
+    ensure_non_empty_string_field(object, "mainlineSummary", &truncate_text(&summary_fallback, 320));
+
+    let method_logic = object
+        .entry("methodLogic")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !method_logic.is_object() {
+        *method_logic = Value::Object(serde_json::Map::new());
+    }
+    let method_logic_object = method_logic
+        .as_object_mut()
+        .expect("methodLogic should be an object after normalization");
+    ensure_non_empty_string_field(method_logic_object, "coreIdea", &summary_fallback);
+    ensure_non_empty_string_field(method_logic_object, "keyModules", "Identify the main modules or steps that carry the method logic.");
+    ensure_non_empty_string_field(method_logic_object, "assumptions", "Check what assumptions the method relies on and whether they are realistic.");
+    ensure_non_empty_string_field(method_logic_object, "applicableConditions", "Clarify in what data, task, or experimental conditions the method is expected to work.");
+
+    let experiment_and_results = object
+        .entry("experimentAndResults")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !experiment_and_results.is_object() {
+        *experiment_and_results = Value::Object(serde_json::Map::new());
+    }
+    let experiment_and_results_object = experiment_and_results
+        .as_object_mut()
+        .expect("experimentAndResults should be an object after normalization");
+    ensure_non_empty_string_field(experiment_and_results_object, "experimentDesign", "Explain datasets, baselines, settings, and what the experiments are trying to prove.");
+    ensure_non_empty_string_field(experiment_and_results_object, "keyFiguresOrTables", "Point to the figures or tables that matter most for understanding the evidence.");
+    ensure_non_empty_string_field(experiment_and_results_object, "importantResults", "Summarize the most decision-relevant results rather than listing every metric.");
+
+    let innovation_and_limitations = object
+        .entry("innovationAndLimitations")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !innovation_and_limitations.is_object() {
+        *innovation_and_limitations = Value::Object(serde_json::Map::new());
+    }
+    let innovation_and_limitations_object = innovation_and_limitations
+        .as_object_mut()
+        .expect("innovationAndLimitations should be an object after normalization");
+    if innovation_and_limitations_object
+        .get("innovations")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
     {
-        let fallback = object
-            .get("summary")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or(summary);
-        object.insert(
-            "mainThreadSummary".into(),
-            Value::String(truncate_text(fallback.trim(), 280)),
+        innovation_and_limitations_object.insert(
+            "innovations".into(),
+            Value::Array(vec![Value::String("The paper appears to contribute a method, framing, or evaluation idea that should be compared against prior work.".into())]),
         );
     }
-
-    if object
+    if innovation_and_limitations_object
         .get("limitations")
         .and_then(Value::as_array)
         .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
     {
-        object.insert(
+        innovation_and_limitations_object.insert(
             "limitations".into(),
-            Value::Array(vec![Value::String("The available evidence should be validated against the full method details and experiment setup.".into())]),
+            Value::Array(vec![Value::String("The current reading still needs to verify hidden assumptions, baseline strength, and scope limits.".into())]),
         );
     }
 
-    let final_advice = object
-        .entry("finalAdvice")
+    let value_for_me = object
+        .entry("valueForMe")
         .or_insert_with(|| Value::Object(serde_json::Map::new()));
-
-    if !final_advice.is_object() {
-        *final_advice = Value::Object(serde_json::Map::new());
+    if !value_for_me.is_object() {
+        *value_for_me = Value::Object(serde_json::Map::new());
     }
-
-    let final_advice_object = final_advice
+    let value_for_me_object = value_for_me
         .as_object_mut()
-        .expect("finalAdvice should be an object after normalization");
-    ensure_non_empty_string_field(final_advice_object, "oneSentenceValue", summary);
-    ensure_non_empty_string_field(final_advice_object, "bestToLearn", "Focus on the paper's core method, assumptions, and evaluation setup.");
-    ensure_non_empty_string_field(final_advice_object, "mostNeedCaution", "Check whether the reported results depend on narrow settings, hidden assumptions, or missing baselines.");
-    ensure_enum_field(
-        final_advice_object,
-        "nextDecision",
-        &["continue_deep_dive", "reference_only", "set_aside"],
-        "continue_deep_dive",
-    );
+        .expect("valueForMe should be an object after normalization");
+    ensure_non_empty_string_field(value_for_me_object, "researchValue", "Explain whether the paper is useful for method borrowing, experiment design, problem framing, or citation background.");
+    if value_for_me_object
+        .get("followupReferences")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
+    {
+        value_for_me_object.insert(
+            "followupReferences".into(),
+            Value::Array(vec![Value::String("Track the strongest baseline papers and the most directly related prior work mentioned by the authors.".into())]),
+        );
+    }
+    ensure_non_empty_string_field(value_for_me_object, "recommendation", "Use this stage to decide whether the paper deserves a deep read or should be retained mainly as a reference.");
 }
 
 fn synthesize_deep_read_fields(object: &mut serde_json::Map<String, Value>, summary: &str) {
+    let summary_fallback = summary.trim();
     ensure_non_empty_string_field(
         object,
-        "noveltyAssessment",
-        "The paper appears directionally useful, but its true novelty should be judged against adjacent prior work and baseline framing.",
+        "coreHypothesis",
+        "State the paper's core claim or hypothesis in a way that can be challenged and verified.",
     );
 
-    if object
-        .get("coreResultSummary")
-        .and_then(Value::as_array)
-        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
-    {
-        object.insert(
-            "coreResultSummary".into(),
-            Value::Array(vec![Value::String(truncate_text(summary.trim(), 280))]),
-        );
-    }
-
-    if object
-        .get("limitations")
-        .and_then(Value::as_array)
-        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
-    {
-        object.insert(
-            "limitations".into(),
-            Value::Array(vec![Value::String("The claims still need validation against the full experimental setup, baseline choice, and scope conditions.".into())]),
-        );
-    }
-
-    let final_summary = object
-        .entry("finalSummary")
+    let key_details = object
+        .entry("keyDetails")
         .or_insert_with(|| Value::Object(serde_json::Map::new()));
-
-    if !final_summary.is_object() {
-        *final_summary = Value::Object(serde_json::Map::new());
+    if !key_details.is_object() {
+        *key_details = Value::Object(serde_json::Map::new());
     }
-
-    let final_summary_object = final_summary
+    let key_details_object = key_details
         .as_object_mut()
-        .expect("finalSummary should be an object after normalization");
-    ensure_non_empty_string_field(final_summary_object, "mostWorthLearning", summary);
-    ensure_non_empty_string_field(
-        final_summary_object,
-        "mostWorthQuestioning",
-        "Check whether the claimed novelty and performance gains remain strong under broader baselines and realistic assumptions.",
-    );
-    ensure_non_empty_string_field(
-        final_summary_object,
-        "researchValueForUser",
-        "Use this paper mainly as a source of method ideas, assumptions to compare, and evaluation design cues.",
-    );
-    if final_summary_object
-        .get("nextThreeActions")
+        .expect("keyDetails should be an object after normalization");
+    ensure_non_empty_string_field(key_details_object, "methodDetails", "Decompose the truly important design or algorithm details rather than repeating the headline method name.");
+    ensure_non_empty_string_field(key_details_object, "experimentDetails", "Decompose the decisive experimental settings, comparisons, and evaluation details.");
+    ensure_non_empty_string_field(key_details_object, "conclusionSupport", "Explain whether the available evidence really supports the paper's conclusion.");
+
+    ensure_non_empty_string_field(object, "authorPathReconstruction", &truncate_text(summary_fallback, 320));
+
+    if object
+        .get("criticalQuestions")
         .and_then(Value::as_array)
         .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
     {
-        final_summary_object.insert(
-            "nextThreeActions".into(),
-            Value::Array(vec![
-                Value::String("Verify the main claim against the exact experimental setup and metric definitions.".into()),
-                Value::String("Compare the method and novelty claim with the strongest directly related prior work.".into()),
-                Value::String("Decide whether the paper is most useful for adoption, citation, or background framing.".into()),
-            ]),
+        object.insert(
+            "criticalQuestions".into(),
+            Value::Array(vec![Value::String("What is the weakest assumption, comparison, or experimental choice in the paper?".into())]),
+        );
+    }
+
+    let reusable_content = object
+        .entry("reusableContent")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !reusable_content.is_object() {
+        *reusable_content = Value::Object(serde_json::Map::new());
+    }
+    let reusable_content_object = reusable_content
+        .as_object_mut()
+        .expect("reusableContent should be an object after normalization");
+    if reusable_content_object
+        .get("reusableIdeas")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
+    {
+        reusable_content_object.insert(
+            "reusableIdeas".into(),
+            Value::Array(vec![Value::String("Extract the main idea that could transfer to your own task or problem setting.".into())]),
+        );
+    }
+    if reusable_content_object
+        .get("reusableMethods")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
+    {
+        reusable_content_object.insert(
+            "reusableMethods".into(),
+            Value::Array(vec![Value::String("Extract any reusable pipeline step, evaluation setup, or experimental control idea.".into())]),
+        );
+    }
+    if reusable_content_object
+        .get("usableCitations")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
+    {
+        reusable_content_object.insert(
+            "usableCitations".into(),
+            Value::Array(vec![Value::String("Capture any citation-worthy framing, benchmark, or comparison statement for later use.".into())]),
+        );
+    }
+
+    let future_directions = object
+        .entry("futureDirections")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !future_directions.is_object() {
+        *future_directions = Value::Object(serde_json::Map::new());
+    }
+    let future_directions_object = future_directions
+        .as_object_mut()
+        .expect("futureDirections should be an object after normalization");
+    if future_directions_object
+        .get("newResearchQuestions")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
+    {
+        future_directions_object.insert(
+            "newResearchQuestions".into(),
+            Value::Array(vec![Value::String("What new research question becomes natural once this paper's logic or limitations are understood?".into())]),
+        );
+    }
+    if future_directions_object
+        .get("followupLiteratureDirections")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
+    {
+        future_directions_object.insert(
+            "followupLiteratureDirections".into(),
+            Value::Array(vec![Value::String("Follow the strongest cited baselines, nearest prior work, and papers that challenge the same assumption.".into())]),
         );
     }
 }
 
 fn synthesize_summary_fields(object: &mut serde_json::Map<String, Value>, summary: &str) {
     ensure_non_empty_string_field(object, "shortSummary", truncate_text(summary.trim(), 220).as_str());
-    ensure_non_empty_string_field(object, "longSummary", summary);
-    ensure_non_empty_string_field(
+
+    let title_and_publication = object
+        .entry("titleAndPublication")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !title_and_publication.is_object() {
+        *title_and_publication = Value::Object(serde_json::Map::new());
+    }
+    let title_and_publication_object = title_and_publication
+        .as_object_mut()
+        .expect("titleAndPublication should be an object after normalization");
+    ensure_non_empty_string_field(title_and_publication_object, "title", "Unknown title");
+    ensure_non_empty_string_field(title_and_publication_object, "authors", "Unknown authors");
+    ensure_non_empty_string_field(title_and_publication_object, "venue", "Unknown venue");
+    ensure_non_empty_string_field(title_and_publication_object, "year", "Unknown year");
+
+    ensure_non_empty_string_field(object, "researchProblem", "Summarize the research problem the paper is trying to solve.");
+    ensure_non_empty_string_field(object, "coreMethod", "Summarize the core method or approach in one compact paragraph.");
+    ensure_non_empty_string_field(object, "coreResults", summary);
+    ensure_non_empty_string_field(object, "valueForMe", "State what inspiration, citation value, or practical value this paper has for the reader.");
+    ensure_enum_field(
         object,
-        "presentationSummary",
-        "This paper is worth framing through its main claim, evidence scope, and practical limits.",
+        "recommendationTag",
+        &["needs_deep_read", "need_followup_references", "background_citation"],
+        "needs_deep_read",
     );
-
-    if object
-        .get("keyTakeaways")
-        .and_then(Value::as_array)
-        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
-    {
-        object.insert(
-            "keyTakeaways".into(),
-            Value::Array(vec![Value::String(truncate_text(summary.trim(), 220))]),
-        );
-    }
-
-    if object
-        .get("recommendedTags")
-        .and_then(Value::as_array)
-        .is_none_or(|items| items.iter().filter_map(Value::as_str).all(|value| value.trim().is_empty()))
-    {
-        object.insert(
-            "recommendedTags".into(),
-            Value::Array(vec![Value::String("needs_deep_read".into())]),
-        );
-    }
 }
 
 fn ensure_non_empty_string_field(
@@ -3594,20 +3813,25 @@ fn synthesize_handoff_key_points(
     match agent_type {
         "quick_read" => {
             push_if_present(&mut key_points, object.get("priorityDecision").and_then(Value::as_str));
-            push_if_present(&mut key_points, object.get("priorityReason").and_then(Value::as_str));
-            push_if_present(&mut key_points, object.get("mainConclusion").and_then(Value::as_str));
+            push_if_present(&mut key_points, object.get("conclusion").and_then(Value::as_str));
+            if let Some(key_information) = object.get("keyInformation").and_then(Value::as_object) {
+                push_if_present(&mut key_points, key_information.get("method").and_then(Value::as_str));
+                push_if_present(&mut key_points, key_information.get("result").and_then(Value::as_str));
+            }
         }
         "careful_read" => {
-            push_if_present(&mut key_points, object.get("mainThreadSummary").and_then(Value::as_str));
-            push_first_array_item(&mut key_points, object.get("keyResults"));
-            push_first_array_item(&mut key_points, object.get("limitations"));
+            push_if_present(&mut key_points, object.get("mainlineSummary").and_then(Value::as_str));
+            if let Some(method_logic) = object.get("methodLogic").and_then(Value::as_object) {
+                push_if_present(&mut key_points, method_logic.get("coreIdea").and_then(Value::as_str));
+            }
+            if let Some(innovation_and_limitations) = object.get("innovationAndLimitations").and_then(Value::as_object) {
+                push_first_array_item(&mut key_points, innovation_and_limitations.get("limitations"));
+            }
         }
         "deep_read" => {
-            push_if_present(&mut key_points, object.get("noveltyAssessment").and_then(Value::as_str));
-            push_first_array_item(&mut key_points, object.get("coreResultSummary"));
-            if let Some(final_summary) = object.get("finalSummary").and_then(Value::as_object) {
-                push_if_present(&mut key_points, final_summary.get("mostWorthLearning").and_then(Value::as_str));
-            }
+            push_if_present(&mut key_points, object.get("coreHypothesis").and_then(Value::as_str));
+            push_if_present(&mut key_points, object.get("authorPathReconstruction").and_then(Value::as_str));
+            push_first_array_item(&mut key_points, object.get("criticalQuestions"));
         }
         _ => {}
     }
@@ -3625,30 +3849,31 @@ fn synthesize_handoff_questions(agent_type: &str, object: &serde_json::Map<Strin
 
     match agent_type {
         "quick_read" => {
-            push_if_present(
-                &mut questions,
-                object
-                    .get("followUpReferences")
-                    .and_then(Value::as_array)
-                    .and_then(|items| items.iter().find_map(Value::as_str)),
-            );
+            if let Some(key_information) = object.get("keyInformation").and_then(Value::as_object) {
+                push_if_present(&mut questions, key_information.get("evidenceSupport").and_then(Value::as_str));
+            }
             if questions.is_empty() {
-                questions.push("Which claim or result should be verified in a deeper read?".into());
+                questions.push("Which problem-method-result claim should be verified first in a careful read?".into());
             }
         }
         "careful_read" => {
-            push_first_array_item(&mut questions, object.get("futureDirections"));
-            push_first_array_item(&mut questions, object.get("limitations"));
+            if let Some(innovation_and_limitations) = object.get("innovationAndLimitations").and_then(Value::as_object) {
+                push_first_array_item(&mut questions, innovation_and_limitations.get("limitations"));
+            }
+            if let Some(value_for_me) = object.get("valueForMe").and_then(Value::as_object) {
+                push_first_array_item(&mut questions, value_for_me.get("followupReferences"));
+            }
             if questions.is_empty() {
-                questions.push("Which limitation or assumption most needs deeper validation?".into());
+                questions.push("Which limitation, assumption, or experiment detail most needs deeper validation?".into());
             }
         }
         "deep_read" => {
-            if let Some(final_summary) = object.get("finalSummary").and_then(Value::as_object) {
-                push_first_array_item(&mut questions, final_summary.get("nextThreeActions"));
+            if let Some(future_directions) = object.get("futureDirections").and_then(Value::as_object) {
+                push_first_array_item(&mut questions, future_directions.get("newResearchQuestions"));
+                push_first_array_item(&mut questions, future_directions.get("followupLiteratureDirections"));
             }
             if questions.is_empty() {
-                questions.push("What should be highlighted in the final summary for future reuse?".into());
+                questions.push("What should be highlighted in the final summary for reuse, citation, or future work?".into());
             }
         }
         _ => {}
@@ -3667,9 +3892,9 @@ fn synthesize_next_step(agent_type: &str, object: &serde_json::Map<String, Value
             .unwrap_or(next_step_for_agent(agent_type))
             .to_string(),
         "careful_read" => object
-            .get("finalAdvice")
+            .get("valueForMe")
             .and_then(Value::as_object)
-            .and_then(|final_advice| final_advice.get("nextDecision"))
+            .and_then(|value_for_me| value_for_me.get("recommendation"))
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(next_step_for_agent(agent_type))
@@ -3725,7 +3950,7 @@ fn next_step_for_agent(agent_type: &str) -> &'static str {
         "quick_read" => "continue",
         "careful_read" => "continue_deep_dive",
         "deep_read" => "summarize",
-        _ => "archive",
+        _ => "background_citation",
     }
 }
 
@@ -4198,6 +4423,15 @@ fn empty_parsed_content() -> ParsedPaperContent {
 fn validate_agent_specific_fields(agent_type: &str, object: &serde_json::Map<String, Value>) -> Result<(), AppError> {
     match agent_type {
         "quick_read" => {
+            require_non_empty_string(object, "conclusion")?;
+            require_non_empty_string_array(object, "reasons")?;
+            let key_information = require_object(object, "keyInformation")?;
+            require_non_empty_string(key_information, "problem")?;
+            require_non_empty_string(key_information, "method")?;
+            require_non_empty_string(key_information, "result")?;
+            require_non_empty_string(key_information, "innovation")?;
+            require_non_empty_string(key_information, "evidenceSupport")?;
+            require_non_empty_string(key_information, "researchValue")?;
             validate_enum(
                 require_non_empty_string(object, "readingRecommendation")?,
                 &["worth_deep_read", "worth_skimming_or_save", "not_recommended"],
@@ -4216,41 +4450,56 @@ fn validate_agent_specific_fields(agent_type: &str, object: &serde_json::Map<Str
             require_non_empty_string(object, "priorityReason")?;
         }
         "careful_read" => {
-            require_non_empty_string(object, "mainThreadSummary")?;
-            require_non_empty_string_array(object, "limitations")?;
-            let final_advice = require_object(object, "finalAdvice")?;
-            require_non_empty_string(final_advice, "oneSentenceValue")?;
-            require_non_empty_string(final_advice, "bestToLearn")?;
-            require_non_empty_string(final_advice, "mostNeedCaution")?;
-            validate_enum(
-                require_non_empty_string(final_advice, "nextDecision")?,
-                &["continue_deep_dive", "reference_only", "set_aside"],
-                "finalAdvice.nextDecision",
-            )?;
+            require_non_empty_string(object, "mainlineSummary")?;
+            let method_logic = require_object(object, "methodLogic")?;
+            require_non_empty_string(method_logic, "coreIdea")?;
+            require_non_empty_string(method_logic, "keyModules")?;
+            require_non_empty_string(method_logic, "assumptions")?;
+            require_non_empty_string(method_logic, "applicableConditions")?;
+            let experiment_and_results = require_object(object, "experimentAndResults")?;
+            require_non_empty_string(experiment_and_results, "experimentDesign")?;
+            require_non_empty_string(experiment_and_results, "keyFiguresOrTables")?;
+            require_non_empty_string(experiment_and_results, "importantResults")?;
+            let innovation_and_limitations = require_object(object, "innovationAndLimitations")?;
+            require_non_empty_string_array(innovation_and_limitations, "innovations")?;
+            require_non_empty_string_array(innovation_and_limitations, "limitations")?;
+            let value_for_me = require_object(object, "valueForMe")?;
+            require_non_empty_string(value_for_me, "researchValue")?;
+            require_non_empty_string_array(value_for_me, "followupReferences")?;
+            require_non_empty_string(value_for_me, "recommendation")?;
         }
         "deep_read" => {
-            require_non_empty_string(object, "noveltyAssessment")?;
-            require_non_empty_string_array(object, "coreResultSummary")?;
-            require_non_empty_string_array(object, "limitations")?;
-            let final_summary = require_object(object, "finalSummary")?;
-            require_non_empty_string(final_summary, "mostWorthLearning")?;
-            require_non_empty_string(final_summary, "mostWorthQuestioning")?;
-            require_non_empty_string(final_summary, "researchValueForUser")?;
-            require_non_empty_string_array(final_summary, "nextThreeActions")?;
+            require_non_empty_string(object, "coreHypothesis")?;
+            let key_details = require_object(object, "keyDetails")?;
+            require_non_empty_string(key_details, "methodDetails")?;
+            require_non_empty_string(key_details, "experimentDetails")?;
+            require_non_empty_string(key_details, "conclusionSupport")?;
+            require_non_empty_string(object, "authorPathReconstruction")?;
+            require_non_empty_string_array(object, "criticalQuestions")?;
+            let reusable_content = require_object(object, "reusableContent")?;
+            require_non_empty_string_array(reusable_content, "reusableIdeas")?;
+            require_non_empty_string_array(reusable_content, "reusableMethods")?;
+            require_non_empty_string_array(reusable_content, "usableCitations")?;
+            let future_directions = require_object(object, "futureDirections")?;
+            require_non_empty_string_array(future_directions, "newResearchQuestions")?;
+            require_non_empty_string_array(future_directions, "followupLiteratureDirections")?;
         }
         "summary" => {
             require_non_empty_string(object, "shortSummary")?;
-            require_non_empty_string(object, "longSummary")?;
-            require_non_empty_string(object, "presentationSummary")?;
-            require_non_empty_string_array(object, "keyTakeaways")?;
-            let tags = require_non_empty_string_array(object, "recommendedTags")?;
-            for tag in tags {
-                validate_enum(
-                    tag,
-                    &["needs_deep_read", "need_followup_references", "background_citation"],
-                    "recommendedTags",
-                )?;
-            }
+            let title_and_publication = require_object(object, "titleAndPublication")?;
+            require_non_empty_string(title_and_publication, "title")?;
+            require_non_empty_string(title_and_publication, "authors")?;
+            require_non_empty_string(title_and_publication, "venue")?;
+            require_non_empty_string(title_and_publication, "year")?;
+            require_non_empty_string(object, "researchProblem")?;
+            require_non_empty_string(object, "coreMethod")?;
+            require_non_empty_string(object, "coreResults")?;
+            require_non_empty_string(object, "valueForMe")?;
+            validate_enum(
+                require_non_empty_string(object, "recommendationTag")?,
+                &["needs_deep_read", "need_followup_references", "background_citation"],
+                "recommendationTag",
+            )?;
         }
         _ => return Err(AppError::SchemaInvalid(format!("unsupported agent type for schema validation: {agent_type}"))),
     }
@@ -4306,7 +4555,7 @@ fn validate_enum(value: &str, allowed: &[&str], field: &str) -> Result<(), AppEr
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_decision_to_stage_state, build_context_plan, build_initial_stage_state,
+        apply_decision_to_stage_state, build_context_plan, build_initial_stage_state, can_finalize_stage,
         extract_action_history_from_snapshot, extract_stage_state_from_snapshot, handoff_chain_sufficient,
         normalize_agent_output, resolve_handoff_summary_ids, select_handoff_summaries,
         update_action_history_in_snapshot, update_stage_state_in_snapshot, AppError, ContextBatch, ContextPlan,
@@ -4438,7 +4687,7 @@ mod tests {
         let context_plan = sample_context_plan();
         let mut stage_state = build_initial_stage_state("quick_read", &context_plan, &[]);
         stage_state.checks.iter_mut().for_each(|check| {
-            if check.id == "value_judgment" {
+            if check.id == "reading_decision" {
                 check.status = "todo".into();
             }
         });
@@ -4449,11 +4698,27 @@ mod tests {
             reason: "Enough evidence collected".into(),
             check_status: vec![
                 DecisionCheckStatus {
-                    id: "anchor_sections".into(),
+                    id: "relevance_and_quality".into(),
                     status: "done".into(),
                 },
                 DecisionCheckStatus {
-                    id: "value_judgment".into(),
+                    id: "problem_method_result".into(),
+                    status: "done".into(),
+                },
+                DecisionCheckStatus {
+                    id: "evidence_support".into(),
+                    status: "done".into(),
+                },
+                DecisionCheckStatus {
+                    id: "reading_decision".into(),
+                    status: "done".into(),
+                },
+                DecisionCheckStatus {
+                    id: "figures".into(),
+                    status: "done".into(),
+                },
+                DecisionCheckStatus {
+                    id: "tables".into(),
                     status: "done".into(),
                 },
             ],
@@ -4470,7 +4735,12 @@ mod tests {
             stage_state,
             &decision,
             Some(&resolved_action),
-            Some(&json!({"summary": "Sufficient support gathered."})),
+            Some(&json!({
+                "summary": "Sufficient support gathered.",
+                "conclusion": "Worth continuing based on the collected signal.",
+                "reasons": ["The problem-method-result chain is visible."],
+                "priorityReason": "The current evidence is strong enough to continue reading."
+            })),
         );
 
         assert_eq!(next_state.iteration, 1);
@@ -4480,9 +4750,9 @@ mod tests {
         assert!(next_state
             .checks
             .iter()
-            .any(|check| check.id == "anchor_sections" && check.evidence_source_ids.iter().any(|item| item == "section:sec-1")));
-        assert!(next_state.checks.iter().any(|check| check.id == "anchor_sections" && check.status == "done"));
-        assert!(next_state.checks.iter().any(|check| check.id == "value_judgment" && check.status == "done"));
+            .any(|check| check.id == "relevance_and_quality" && check.evidence_source_ids.iter().any(|item| item == "section:sec-1")));
+        assert!(next_state.checks.iter().any(|check| check.id == "relevance_and_quality" && check.status == "done"));
+        assert!(next_state.checks.iter().any(|check| check.id == "reading_decision" && check.status == "done"));
     }
 
     #[test]
@@ -4522,7 +4792,63 @@ mod tests {
     }
 
     #[test]
-    fn quick_read_output_synthesizes_missing_decision_reason_and_five_cs() {
+    fn blocked_does_not_mark_stage_enough_when_checks_are_incomplete() {
+        let context_plan = sample_context_plan();
+        let stage_state = build_initial_stage_state("quick_read", &context_plan, &[]);
+        let decision = DecisionEnvelope {
+            action: "blocked".into(),
+            target: None,
+            reason: "No productive next step found".into(),
+            check_status: vec![],
+            open_questions: vec!["still need experimental support".into()],
+        };
+
+        let next_state = apply_decision_to_stage_state(
+            stage_state,
+            &decision,
+            None,
+            Some(&json!({
+                "summary": "Evidence is still incomplete.",
+                "conclusion": "Cannot recommend continuing yet.",
+                "reasons": ["The experimental support has not been checked."],
+                "priorityReason": "Key checks are still incomplete."
+            })),
+        );
+
+        assert!(!next_state.enough);
+        assert_eq!(next_state.iteration, 1);
+    }
+
+    #[test]
+    fn can_finalize_stage_requires_checks_and_ready_output() {
+        let context_plan = sample_context_plan();
+        let mut stage_state = build_initial_stage_state("quick_read", &context_plan, &[]);
+        for check in &mut stage_state.checks {
+            check.status = "done".into();
+        }
+
+        assert!(!can_finalize_stage(
+            &stage_state,
+            Some(&json!({
+                "summary": "Visible signal exists.",
+                "conclusion": "Maybe continue.",
+                "priorityReason": "Still missing reasons array."
+            }))
+        ));
+
+        assert!(can_finalize_stage(
+            &stage_state,
+            Some(&json!({
+                "summary": "Visible signal exists.",
+                "conclusion": "Continue reading.",
+                "reasons": ["Problem, method, and result chain are visible."],
+                "priorityReason": "The output schema is complete and supported."
+            }))
+        ));
+    }
+
+    #[test]
+    fn quick_read_output_synthesizes_new_screening_fields() {
         let parsed = json!({
             "summary": "The paper is promising because it has a clear problem framing and visible result signal.",
             "evidence": [
@@ -4541,20 +4867,25 @@ mod tests {
 
         let normalized = normalize_agent_output("quick_read", parsed).expect("normalization should succeed");
         let object = normalized.output_json.as_object().expect("normalized output should remain an object");
-        let five_cs = object
-            .get("fiveCs")
+        let key_information = object
+            .get("keyInformation")
             .and_then(|value| value.as_object())
-            .expect("fiveCs should be synthesized");
+            .expect("keyInformation should be synthesized");
 
         assert_eq!(
-            object.get("decisionReason").and_then(|value| value.as_str()),
-            Some("The visible result signal is strong enough to justify a deeper read.")
+            object.get("conclusion").and_then(|value| value.as_str()),
+            Some("The paper is promising because it has a clear problem framing and visible result signal.")
         );
-        assert!(five_cs.get("category").and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty()));
-        assert!(five_cs.get("context").and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty()));
-        assert!(five_cs.get("correctness").and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty()));
-        assert!(five_cs.get("contributions").and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty()));
-        assert!(five_cs.get("clarity").and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty()));
+        assert!(object
+            .get("reasons")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| !items.is_empty()));
+        assert!(key_information.get("problem").and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty()));
+        assert!(key_information.get("method").and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty()));
+        assert!(key_information.get("result").and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty()));
+        assert!(key_information.get("innovation").and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty()));
+        assert!(key_information.get("evidenceSupport").and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty()));
+        assert!(key_information.get("researchValue").and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty()));
     }
 
     #[test]
@@ -4608,21 +4939,27 @@ mod tests {
             .expect("normalized output should be an object");
 
         assert!(object
-            .get("mainThreadSummary")
+            .get("mainlineSummary")
             .and_then(|value| value.as_str())
             .is_some_and(|value| !value.trim().is_empty()));
         assert!(object
-            .get("limitations")
+            .get("methodLogic")
+            .and_then(|value| value.as_object())
+            .and_then(|value| value.get("coreIdea"))
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty()));
+        assert!(object
+            .get("innovationAndLimitations")
+            .and_then(|value| value.as_object())
+            .and_then(|value| value.get("limitations"))
             .and_then(|value| value.as_array())
             .is_some_and(|items| !items.is_empty()));
-        assert_eq!(
-            object
-                .get("finalAdvice")
-                .and_then(|value| value.as_object())
-                .and_then(|value| value.get("nextDecision"))
-                .and_then(|value| value.as_str()),
-            Some("continue_deep_dive")
-        );
+        assert!(object
+            .get("valueForMe")
+            .and_then(|value| value.as_object())
+            .and_then(|value| value.get("followupReferences"))
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| !items.is_empty()));
     }
 
     #[test]
@@ -4646,29 +4983,31 @@ mod tests {
             .expect("normalized output should be an object");
 
         assert!(object
-            .get("noveltyAssessment")
+            .get("coreHypothesis")
             .and_then(|value| value.as_str())
             .is_some_and(|value| !value.trim().is_empty()));
         assert!(object
-            .get("coreResultSummary")
-            .and_then(|value| value.as_array())
-            .is_some_and(|items| !items.is_empty()));
-        assert!(object
-            .get("limitations")
-            .and_then(|value| value.as_array())
-            .is_some_and(|items| !items.is_empty()));
-        assert!(object
-            .get("finalSummary")
+            .get("keyDetails")
             .and_then(|value| value.as_object())
-            .and_then(|value| value.get("nextThreeActions"))
+            .and_then(|value| value.get("methodDetails"))
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty()));
+        assert!(object
+            .get("criticalQuestions")
             .and_then(|value| value.as_array())
-            .is_some_and(|items| items.len() == 3));
+            .is_some_and(|items| !items.is_empty()));
+        assert!(object
+            .get("futureDirections")
+            .and_then(|value| value.as_object())
+            .and_then(|value| value.get("followupLiteratureDirections"))
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| !items.is_empty()));
     }
 
     #[test]
     fn summary_output_synthesizes_missing_required_fields() {
         let parsed = json!({
-            "longSummary": "The paper introduces a promising idea with enough signal to justify a deeper read, but the final judgment still depends on verifying the evidence and assumptions."
+            "coreResults": "The paper introduces a promising idea with enough signal to justify a deeper read, but the final judgment still depends on verifying the evidence and assumptions."
         });
 
         let normalized = normalize_agent_output("summary", parsed).expect("normalization should succeed");
@@ -4679,18 +5018,18 @@ mod tests {
 
         assert_eq!(object.get("summary").and_then(|value| value.as_str()), object.get("shortSummary").and_then(|value| value.as_str()));
         assert!(object
-            .get("presentationSummary")
+            .get("titleAndPublication")
+            .and_then(|value| value.as_object())
+            .and_then(|value| value.get("title"))
             .and_then(|value| value.as_str())
             .is_some_and(|value| !value.trim().is_empty()));
         assert!(object
-            .get("keyTakeaways")
-            .and_then(|value| value.as_array())
-            .is_some_and(|items| !items.is_empty()));
+            .get("researchProblem")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty()));
         assert_eq!(
             object
-                .get("recommendedTags")
-                .and_then(|value| value.as_array())
-                .and_then(|items| items.first())
+                .get("recommendationTag")
                 .and_then(|value| value.as_str()),
             Some("needs_deep_read")
         );

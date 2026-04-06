@@ -2,6 +2,8 @@ use quick_xml::{events::Event, name::QName, Reader};
 
 use crate::{errors::AppError, models::paper::SearchPaperItem};
 
+const ARXIV_API_ENDPOINTS: [&str; 2] = ["https://arxiv.org/api/query", "https://export.arxiv.org/api/query"];
+
 pub struct ArxivProvider {
     client: reqwest::Client,
 }
@@ -18,28 +20,50 @@ impl ArxivProvider {
     pub async fn search(&self, query: &str, page: usize, page_size: usize) -> Result<Vec<SearchPaperItem>, AppError> {
         let trimmed_query = query.trim();
         let start = page.saturating_sub(1) * page_size;
-        let request = if let Some(arxiv_id) = extract_arxiv_id(trimmed_query) {
-            self.client
-                .get("https://export.arxiv.org/api/query")
-                .query(&[("id_list", arxiv_id), ("start", "0"), ("max_results", "1")])
+        let query_params = if let Some(arxiv_id) = extract_arxiv_id(trimmed_query) {
+            vec![
+                ("id_list".to_string(), arxiv_id.to_string()),
+                ("start".to_string(), "0".to_string()),
+                ("max_results".to_string(), "1".to_string()),
+            ]
         } else {
-            self.client
-                .get("https://export.arxiv.org/api/query")
-                .query(&[
-                    ("search_query", format!("all:{trimmed_query}")),
-                    ("start", start.to_string()),
-                    ("max_results", page_size.to_string()),
-                ])
+            vec![
+                ("search_query".to_string(), format!("all:{trimmed_query}")),
+                ("start".to_string(), start.to_string()),
+                ("max_results".to_string(), page_size.to_string()),
+            ]
         };
 
-        let response = request.send().await?.error_for_status()?;
-        let xml = response.text().await?;
+        let xml = self.fetch_feed(&query_params).await?;
         let entries = parse_arxiv_entries(&xml)?;
 
         Ok(entries
             .into_iter()
             .filter_map(|entry| map_entry(entry).ok())
             .collect())
+    }
+
+    async fn fetch_feed(&self, query_params: &[(String, String)]) -> Result<String, AppError> {
+        let mut last_error = None;
+
+        for endpoint in ARXIV_API_ENDPOINTS {
+            match self.client.get(endpoint).query(query_params).send().await {
+                Ok(response) => match response.error_for_status() {
+                    Ok(success) => {
+                        return success
+                            .text()
+                            .await
+                            .map_err(|error| AppError::UpstreamUnavailable(error.to_string()));
+                    }
+                    Err(error) => last_error = Some(format!("{endpoint}: {error}")),
+                },
+                Err(error) => last_error = Some(format!("{endpoint}: {error}")),
+            }
+        }
+
+        Err(AppError::UpstreamUnavailable(
+            last_error.unwrap_or_else(|| "failed to reach arXiv API".to_string()),
+        ))
     }
 }
 

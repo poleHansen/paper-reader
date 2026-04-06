@@ -93,6 +93,7 @@ export function App() {
   const [profile, setProfile] = useState<UserProfile>(defaultProfile);
   const [statusText, setStatusText] = useState('Ready');
   const [isTestingGitHubUpload, setIsTestingGitHubUpload] = useState(false);
+  const [isTestingModel, setIsTestingModel] = useState(false);
   const [modelStatus, setModelStatus] = useState<ModelConnectionResult | null>(null);
   const [savedModels, setSavedModels] = useState<ModelConfigResponse[]>([]);
   const [selectedModelId, setSelectedModelId] = useState('');
@@ -393,6 +394,8 @@ export function App() {
 
   async function handleTestModel() {
     try {
+      setIsTestingModel(true);
+      setStatusText('Testing model endpoint...');
       const result = await testModelConnection({
         provider: modelDraft.provider,
         baseUrl: modelDraft.baseUrl,
@@ -414,6 +417,8 @@ export function App() {
       );
     } catch (error) {
       setStatusText(formatError(error));
+    } finally {
+      setIsTestingModel(false);
     }
   }
 
@@ -870,7 +875,7 @@ export function App() {
               <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="agent memory, retrieval augmented reasoning..." />
               <button onClick={() => void handleSearch()}>Search arXiv</button>
             </div>
-            <div className="list">
+            <div className="list searchResultsScroll">
               {searchResults.length > 0 ? (
                 searchResults.map((item) => (
                   <article className="listItem" key={item.id}>
@@ -1391,7 +1396,7 @@ export function App() {
         ) : null}
 
         {activeView === 'model' ? (
-          <section className="card pageCard">
+          <section className="card pageCard modelPageScroll">
             <span className="eyebrow">Model settings</span>
             <h2>Connection baseline</h2>
             <p className="muted">Reader runtime now restores the most recently selected saved model. You can give presets a name, save multiple endpoints, and switch between them later.</p>
@@ -1428,7 +1433,10 @@ export function App() {
             </div>
             <div className="row rowWrap">
               <button onClick={() => void handleSaveModel()}>{selectedModelId ? 'Update preset' : 'Save preset'}</button>
-              <button className="secondaryButton" onClick={() => void handleTestModel()}>Test endpoint</button>
+              <button className="secondaryButton buttonWithSpinner" onClick={() => void handleTestModel()} disabled={isTestingModel}>
+                {isTestingModel ? <span className="buttonSpinner" aria-hidden="true" /> : null}
+                <span>{isTestingModel ? 'Testing endpoint...' : 'Test endpoint'}</span>
+              </button>
               {selectedModelId ? <button className="secondaryButton" onClick={() => void handleDeleteSelectedModel()}>Delete preset</button> : null}
             </div>
             {modelNeedsGithubHosting ? (
@@ -1911,14 +1919,33 @@ function renderRunSnapshot(outputSnapshot: string | null) {
       shortSummary?: string;
       longSummary?: string;
       keyTakeaways?: string[];
+      reasons?: string[];
+      criticalQuestions?: string[];
+      recommendationTag?: string;
+      valueForMe?: string | { researchValue?: string };
+      coreResults?: string;
     };
+
+    const bullets = parsed.keyTakeaways ?? parsed.reasons ?? parsed.criticalQuestions;
+    const valueForMe =
+      typeof parsed.valueForMe === 'string'
+        ? parsed.valueForMe
+        : parsed.valueForMe?.researchValue;
+    const summaryText =
+      parsed.summary ??
+      parsed.shortSummary ??
+      parsed.coreResults ??
+      valueForMe ??
+      parsed.longSummary ??
+      'No summary available.';
 
     return (
       <div className="detailGroup">
-        <p>{parsed.summary ?? parsed.shortSummary ?? parsed.longSummary ?? 'No summary available.'}</p>
-        {parsed.keyTakeaways && parsed.keyTakeaways.length > 0 ? (
+        <p>{summaryText}</p>
+        {parsed.recommendationTag ? <p><strong>Tag:</strong> {parsed.recommendationTag}</p> : null}
+        {bullets && bullets.length > 0 ? (
           <ul className="detailList">
-            {parsed.keyTakeaways.map((item) => (
+            {bullets.map((item) => (
               <li key={item}>{item}</li>
             ))}
           </ul>
