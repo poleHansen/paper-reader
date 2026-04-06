@@ -11,10 +11,17 @@
 
 body {
   margin: 0;
+  height: 100vh;
+  overflow: hidden;
   background:
     radial-gradient(circle at top left, rgba(22, 89, 70, 0.16), transparent 25%),
     radial-gradient(circle at right center, rgba(170, 90, 55, 0.18), transparent 20%),
     #efe7da;
+}
+
+#root {
+  height: 100vh;
+  overflow: hidden;
 }
 
 button,
@@ -40,6 +47,38 @@ input {
   background: rgba(255, 251, 245, 0.8);
 }
 
+.uploadCardCompact input,
+.uploadCardCompact textarea,
+.uploadCardCompact select {
+  padding: 0.72rem 0.9rem;
+  border-radius: 14px;
+}
+
+.passwordField {
+  position: relative;
+  width: 100%;
+}
+
+.passwordFieldInput {
+  padding-right: 3.25rem;
+}
+
+.passwordToggle {
+  position: absolute;
+  top: 50%;
+  right: 0.45rem;
+  transform: translateY(-50%);
+  width: 2.3rem;
+  height: 2.3rem;
+  padding: 0;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  background: rgba(255, 255, 255, 0.78);
+  color: #1e1914;
+  border: 1px solid rgba(30, 25, 20, 0.12);
+}
+
 select {
   width: 100%;
   border: 1px solid rgba(30, 25, 20, 0.15);
@@ -49,18 +88,21 @@ select {
 }
 
 .shell {
-  min-height: 100vh;
+  height: 100vh;
   display: grid;
   grid-template-columns: 280px 1fr;
+  overflow: hidden;
 }
 
 .sidebar {
+  height: 100vh;
   padding: 2rem;
   background: rgba(255, 248, 240, 0.8);
   border-right: 1px solid rgba(30, 25, 20, 0.1);
   display: grid;
   align-content: start;
   gap: 1rem;
+  overflow-y: auto;
 }
 
 .brandBlock {
@@ -69,11 +111,22 @@ select {
 }
 
 .status {
+  min-width: 0;
   padding: 1rem;
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.65);
   display: grid;
   gap: 0.45rem;
+}
+
+.status strong,
+.status span,
+.sidebarMeta,
+.sidebarMeta strong,
+.sidebarMeta span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .sidebarMeta {
@@ -101,9 +154,13 @@ select {
 }
 
 .content {
+  min-width: 0;
+  min-height: 0;
+  height: 100vh;
   padding: 2rem;
   display: grid;
   gap: 1.5rem;
+  overflow: hidden;
 }
 
 .grid {
@@ -123,6 +180,7 @@ select {
 .pageCard {
   display: grid;
   gap: 1rem;
+  min-height: 0;
 }
 
 .pageCardReader {
@@ -132,10 +190,12 @@ select {
 }
 
 .pageCardReaderModern {
-  min-height: calc(100vh - 4rem);
+  min-height: 0;
+  height: calc(100vh - 4rem);
   display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
   gap: 1rem;
-  align-content: start;
+  overflow: hidden;
 }
 
 .hero {
@@ -156,6 +216,23 @@ select {
   gap: 0.75rem;
 }
 
+.searchBarRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.searchBarRow input {
+  min-width: 0;
+}
+
+.searchBarRow button {
+  width: auto;
+  min-width: 140px;
+  white-space: nowrap;
+}
+
 .rowEnd {
   justify-content: flex-end;
 }
@@ -174,6 +251,21 @@ select {
   display: grid;
   gap: 0.75rem;
   margin-top: 1rem;
+  min-height: 0;
+}
+
+.libraryListScroll {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 0.65rem;
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.libraryListScroll::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 .compactList {
@@ -209,6 +301,11 @@ select {
   gap: 1rem;
 }
 
+.sectionHeaderCompact {
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+
 .muted {
   margin: 0.25rem 0 0;
   color: rgba(30, 25, 20, 0.7);
@@ -231,6 +328,11 @@ select {
   gap: 0.6rem;
 }
 
+.workflowStripCompact {
+  grid-template-columns: repeat(4, minmax(0, 1fr)) minmax(120px, 0.9fr);
+  gap: 0.5rem;
+}
+
 .workflowStripCard {
   display: grid;
   gap: 0.2rem;
@@ -241,20 +343,79 @@ select {
   border: 1px solid rgba(30, 25, 20, 0.08);
 }
 
+.workflowStripCardCompact {
+  padding: 0.55rem 0.7rem;
+  gap: 0.15rem;
+}
+
+.workflowStripCardWide {
+  min-width: 0;
+}
+
 .workflowStripCard strong {
   font-size: 0.95rem;
   line-height: 1.2;
+}
+
+.workflowStripCardCompact strong {
+  font-size: 0.9rem;
 }
 
 .readerHeaderActions {
   justify-content: flex-end;
 }
 
+.readerHeaderCompact {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+}
+
+.readerHeaderIntro {
+  min-width: 0;
+}
+
+.readerHeaderIntro h2 {
+  margin: 0.2rem 0 0;
+}
+
+.readerToolbarCompact {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: flex-start;
+  gap: 0.6rem;
+}
+
+.readerToolbarMode {
+  display: grid;
+  gap: 0.3rem;
+  min-width: 180px;
+}
+
+.readerToolbarMode select {
+  min-width: 180px;
+  padding: 0.6rem 0.85rem;
+}
+
+.readerHeaderActionsCompact {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.45rem;
+}
+
+.readerHeaderActionsCompact button {
+  padding: 0.58rem 0.85rem;
+}
+
 .readerSplitLayout {
   display: grid;
   grid-template-columns: minmax(0, 1.45fr) minmax(360px, 0.9fr);
   gap: 1rem;
-  min-height: calc(100vh - 16rem);
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
 }
 
 .readerDocumentPane,
@@ -266,7 +427,10 @@ select {
 .readerDocumentPane,
 .readerAgentPane {
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 0.85rem;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .readerPaneHeader {
@@ -278,8 +442,9 @@ select {
 
 .readerDocumentViewport {
   min-height: 0;
-  height: calc(100vh - 19.5rem);
-  overflow: hidden;
+  height: 100%;
+  overflow: auto;
+  overscroll-behavior: contain;
   border-radius: 22px;
   background: rgba(255, 255, 255, 0.58);
   border: 1px solid rgba(30, 25, 20, 0.08);
@@ -294,11 +459,12 @@ select {
 
 .readerAgentBody {
   min-height: 0;
-  height: calc(100vh - 19.5rem);
+  height: 100%;
   display: grid;
   gap: 0.85rem;
   align-content: start;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding-right: 0.35rem;
 }
 
@@ -329,12 +495,60 @@ select {
   gap: 0.35rem;
 }
 
+.uploadPageScroll {
+  min-height: 0;
+  height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 0.35rem;
+}
+
+.uploadPageScrollCompact {
+  padding-right: 0;
+}
+
 .uploadLayout {
   align-items: start;
 }
 
+.uploadLayoutCompact {
+  gap: 1rem;
+}
+
 .uploadWideCard {
   grid-column: 1 / -1;
+}
+
+.uploadCardCompact {
+  gap: 0.75rem;
+  padding: 1.1rem;
+  border-radius: 24px;
+}
+
+.uploadCardCompact h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.uploadCardCompact .muted {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.uploadMetadataCardCompact {
+  gap: 0.65rem;
+}
+
+.uploadFormGridCompact {
+  gap: 0.6rem;
+}
+
+.uploadActionsCompact {
+  gap: 0.5rem;
+}
+
+.uploadActionsCompact button {
+  padding: 0.65rem 0.9rem;
 }
 
 .formGrid {
@@ -356,6 +570,23 @@ select {
   overflow: hidden;
 }
 
+.readerPanel > *,
+.readerPanel span,
+.readerPanel strong,
+.readerPanel p,
+.visualPreviewCard > *,
+.visualPreviewCard span,
+.visualPreviewCard strong,
+.visualPreviewCard p,
+.detailGroup > *,
+.detailGroup span,
+.detailGroup strong,
+.detailGroup p {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .readerPanelScrollable {
   min-height: 0;
   overflow-y: auto;
@@ -363,13 +594,32 @@ select {
   padding-right: 0.65rem;
 }
 
-.readerPanelScrollable::-webkit-scrollbar {
-  width: 10px;
+.scrollbarHidden {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
 }
 
-.readerPanelScrollable::-webkit-scrollbar-thumb {
-  background: rgba(30, 25, 20, 0.22);
-  border-radius: 999px;
+.scrollbarHidden::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+.sidebar,
+.readerDocumentViewport,
+.readerAgentBody,
+.uploadPageScroll,
+.readerPanelScrollable {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.sidebar::-webkit-scrollbar,
+.readerDocumentViewport::-webkit-scrollbar,
+.readerAgentBody::-webkit-scrollbar,
+.uploadPageScroll::-webkit-scrollbar,
+.readerPanelScrollable::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 .actionStack {
@@ -649,6 +899,12 @@ pre {
   border: 1px solid rgba(30, 25, 20, 0.08);
 }
 
+.selectedFileCardCompact {
+  gap: 0.25rem;
+  padding: 0.75rem 0.85rem;
+  border-radius: 16px;
+}
+
 .selectedFileCard span {
   color: rgba(30, 25, 20, 0.68);
   word-break: break-word;
@@ -700,6 +956,14 @@ pre {
 }
 
 @media (max-width: 960px) {
+  body,
+  #root,
+  .shell,
+  .content {
+    height: auto;
+    overflow: visible;
+  }
+
   .shell,
   .grid,
   .readerGrid,
@@ -708,12 +972,14 @@ pre {
   .workflowStrip,
   .readerSplitLayout,
   .visualsPageLayout,
-  .actionStackInline {
+  .actionStackInline,
+  .readerHeaderCompact {
     grid-template-columns: 1fr;
   }
 
-  .shell {
-    min-height: 100vh;
+  .sidebar {
+    height: auto;
+    overflow: visible;
   }
 
   .hero,
@@ -724,6 +990,25 @@ pre {
     align-items: stretch;
   }
 
+  .readerToolbarCompact,
+  .readerHeaderActionsCompact {
+    justify-content: stretch;
+  }
+
+  .readerToolbarMode,
+  .readerToolbarMode select,
+  .readerHeaderActionsCompact button {
+    width: 100%;
+  }
+
+  .searchBarRow {
+    grid-template-columns: 1fr;
+  }
+
+  .searchBarRow button {
+    width: 100%;
+  }
+
   .content,
   .pageCardReader,
   .pageCardReaderModern,
@@ -732,7 +1017,10 @@ pre {
   .readerDocumentViewport,
   .readerAgentBody,
   .readerSplitLayout,
-  .visualsPageLayout {
+  .visualsPageLayout,
+  .readerDocumentPane,
+  .readerAgentPane,
+  .uploadPageScroll {
     min-height: auto;
     height: auto;
   }
@@ -741,7 +1029,11 @@ pre {
   .pageCardReaderModern,
   .readerPanelAnalysis,
   .readerDocumentViewport,
-  .readerAgentBody {
+  .readerAgentBody,
+  .readerSplitLayout,
+  .readerDocumentPane,
+  .readerAgentPane,
+  .uploadPageScroll {
     overflow: visible;
   }
 

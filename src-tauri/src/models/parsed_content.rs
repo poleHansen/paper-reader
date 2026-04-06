@@ -68,6 +68,15 @@ pub struct ParsedNearbyContext {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ParsedPanelAsset {
+    pub index: i32,
+    pub bounding_box: ParsedBoundingBox,
+    pub image_path: String,
+    pub thumbnail_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ParsedFigure {
     pub id: String,
     pub label: String,
@@ -86,6 +95,12 @@ pub struct ParsedFigure {
     pub bounding_box: Option<ParsedBoundingBox>,
     #[serde(default)]
     pub caption_bounding_box: Option<ParsedBoundingBox>,
+    #[serde(default)]
+    pub panel_boxes: Vec<ParsedBoundingBox>,
+    #[serde(default)]
+    pub panel_count: Option<i32>,
+    #[serde(default)]
+    pub panel_assets: Vec<ParsedPanelAsset>,
     #[serde(default)]
     pub mentions: Vec<ParsedObjectMention>,
     #[serde(default)]
@@ -271,6 +286,25 @@ mod tests {
                         "confidence": 0.91,
                         "boundingBox": { "x": 60.0, "y": 150.0, "width": 280.0, "height": 190.0 },
                         "captionBoundingBox": { "x": 60.0, "y": 348.0, "width": 210.0, "height": 22.0 },
+                        "panelBoxes": [
+                            { "x": 60.0, "y": 150.0, "width": 135.0, "height": 190.0 },
+                            { "x": 205.0, "y": 150.0, "width": 135.0, "height": 190.0 }
+                        ],
+                        "panelCount": 2,
+                        "panelAssets": [
+                            {
+                                "index": 1,
+                                "boundingBox": { "x": 60.0, "y": 150.0, "width": 135.0, "height": 190.0 },
+                                "imagePath": "D:/tmp/figure-2-panel-1.png",
+                                "thumbnailPath": "D:/tmp/figure-2-panel-1-thumb.png"
+                            },
+                            {
+                                "index": 2,
+                                "boundingBox": { "x": 205.0, "y": 150.0, "width": 135.0, "height": 190.0 },
+                                "imagePath": "D:/tmp/figure-2-panel-2.png",
+                                "thumbnailPath": "D:/tmp/figure-2-panel-2-thumb.png"
+                            }
+                        ],
                         "mentions": [
                             {
                                 "sectionId": "sec_1",
@@ -318,6 +352,10 @@ mod tests {
 
         assert_eq!(figure.bounding_box.as_ref().expect("bbox").width, 280.0);
         assert_eq!(figure.caption_bounding_box.as_ref().expect("caption bbox").height, 22.0);
+        assert_eq!(figure.panel_boxes.len(), 2);
+        assert_eq!(figure.panel_count, Some(2));
+        assert_eq!(figure.panel_assets.len(), 2);
+        assert!(figure.panel_assets[0].image_path.ends_with("panel-1.png"));
         assert_eq!(figure.mentions.len(), 1);
         assert_eq!(figure.mentions[0].sentence, "We compare the pipeline in Figure 2 against the baseline.");
     }

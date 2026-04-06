@@ -31,7 +31,6 @@ import {
 import type {
   AgentRunDetail,
   AnalyzeVisualsResponse,
-  ActionHistoryItem,
   ConfirmPaperMetadataResponse,
   EvidenceItem,
   LibraryItem,
@@ -46,8 +45,6 @@ import type {
   ParsedFigure,
   ParsedTable,
   ReaderSnapshot,
-  StageCheckItem,
-  StageState,
   UserProfile,
   VisualDiagnostic,
 } from '../types/contracts';
@@ -80,6 +77,13 @@ const defaultProfile: UserProfile = {
   githubToken: null,
   hasGithubToken: false,
 };
+
+const workflowPrimaryActions = [
+  { action: 'run_quick_read', agent: 'quick_read', label: 'Quick read' },
+  { action: 'run_careful_read', agent: 'careful_read', label: 'Careful read' },
+  { action: 'run_deep_read', agent: 'deep_read', label: 'Deep read' },
+  { action: 'run_summary', agent: 'summary', label: 'Summary' },
+] as const;
 
 export function App() {
   const [activeView, setActiveView] = useState<View>('dashboard');
@@ -127,7 +131,21 @@ export function App() {
   });
   const [activeRun, setActiveRun] = useState<AgentRunDetail | null>(null);
   const [agentVisualMode, setAgentVisualMode] = useState('on_demand');
+  const [runProgressTick, setRunProgressTick] = useState(0);
   const libraryHighlights = libraryItems.slice(0, 3);
+  const workflowPrimaryAction = resolveWorkflowPrimaryAction(readerSnapshot, workflowPrimaryActions);
+  const displayedParseStatus = activeRun
+    ? deriveRunParseStatus(activeRun.status)
+    : parseStatus?.parseStatus ?? readerSnapshot?.parseStatus ?? null;
+  const displayedParseProgress = activeRun
+    ? deriveRunProgress(activeRun, runProgressTick)
+    : parseStatus?.progress ?? readerSnapshot?.parseProgress ?? 0;
+  const displayedWorkflowStep = activeRun
+    ? deriveRunWorkflowStep(activeRun.agentType, activeRun.status)
+    : parseStatus?.stage ?? readerSnapshot?.workflowCurrentStep ?? null;
+  const displayedNextAction = activeRun
+    ? deriveRunNextAction(activeRun.status)
+    : readerSnapshot?.nextActionRequired ?? null;
   const effectiveGithubBranch = profile.githubRepoBranch?.trim() || 'main';
   const hasGithubTokenValue = Boolean(profile.githubToken?.trim() || profile.hasGithubToken);
   const githubHostingReady = Boolean(
@@ -155,6 +173,20 @@ export function App() {
 
     return () => window.clearInterval(timer);
   }, [selectedPaperId, activeView]);
+
+  useEffect(() => {
+    if (!activeRun || activeRun.status !== 'running') {
+      setRunProgressTick(0);
+      return;
+    }
+
+    setRunProgressTick(0);
+    const timer = window.setInterval(() => {
+      setRunProgressTick((current) => current + 1);
+    }, 1200);
+
+    return () => window.clearInterval(timer);
+  }, [activeRun?.id, activeRun?.status]);
 
   useEffect(() => {
     let unlisten: UnlistenFn | null = null;
@@ -430,11 +462,19 @@ export function App() {
     setStatusText('Selected file cleared');
   }
 
-  async function handleImportLink() {
+  async function handleImportLink(urlOverride?: string) {
+    const targetUrl = (urlOverride ?? paperUrl).trim();
+    if (!targetUrl) {
+      setStatusText('Paste a paper URL first');
+      return;
+    }
+
     try {
-      const result = await importPaperFromLink({ url: paperUrl });
+      setPaperUrl(targetUrl);
+      setStatusText(`Importing ${targetUrl}`);
+      const result = await importPaperFromLink({ url: targetUrl });
       setSelectedPaperId(result.paperId);
-      setMetadataDraft((current) => ({ ...current, paperId: result.paperId, title: paperUrl }));
+      setMetadataDraft((current) => ({ ...current, paperId: result.paperId, title: targetUrl }));
       setStatusText(`Imported ${result.paperId} from link`);
       if (!result.metadataNeedsConfirmation) {
         await loadReaderSnapshot(result.paperId);
@@ -636,9 +676,7 @@ export function App() {
   }
 
   function handleSelectSearchResult(item: PaperSearchResult) {
-    setPaperUrl(item.pdfUrl ?? item.detailUrl);
-    setStatusText(`Prepared ${item.title} for import`);
-    setActiveView('upload');
+    void handleImportLink(item.pdfUrl ?? item.detailUrl);
   }
 
   function handleSkipOnboarding() {
@@ -780,15 +818,22 @@ export function App() {
               <input value={profile.githubRepoBranch ?? ''} onChange={(event) => setProfile({ ...profile, githubRepoBranch: event.target.value || null })} placeholder="github branch" />
               <input value={profile.githubRepoPathPrefix ?? ''} onChange={(event) => setProfile({ ...profile, githubRepoPathPrefix: event.target.value || null })} placeholder="github path prefix (optional)" />
               <input value={profile.githubCdnBaseUrl ?? ''} onChange={(event) => setProfile({ ...profile, githubCdnBaseUrl: event.target.value || null })} placeholder="github cdn/raw base url (optional)" />
-              <div className="row rowWrap">
+              <div className="passwordField">
                 <input
+                  className="passwordFieldInput"
                   type={showGithubToken ? 'text' : 'password'}
                   value={profile.githubToken ?? ''}
                   onChange={(event) => setProfile({ ...profile, githubToken: event.target.value || null })}
                   placeholder={hasGithubTokenValue ? 'github token already saved; enter to replace' : 'github token'}
                 />
-                <button className="secondaryButton" type="button" onClick={() => setShowGithubToken((value) => !value)}>
-                  {showGithubToken ? 'Hide token' : 'Show token'}
+                <button
+                  className="passwordToggle"
+                  type="button"
+                  onClick={() => setShowGithubToken((value) => !value)}
+                  aria-label={showGithubToken ? 'Hide token' : 'Show token'}
+                  title={showGithubToken ? 'Hide token' : 'Show token'}
+                >
+                  {showGithubToken ? '🙈' : '👁'}
                 </button>
               </div>
             </div>
@@ -821,7 +866,7 @@ export function App() {
                 <p className="muted">Search results can be staged into the upload flow, then moved into Reader.</p>
               </div>
             </div>
-            <div className="row">
+            <div className="searchBarRow">
               <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="agent memory, retrieval augmented reasoning..." />
               <button onClick={() => void handleSearch()}>Search arXiv</button>
             </div>
@@ -849,111 +894,115 @@ export function App() {
         ) : null}
 
         {activeView === 'upload' ? (
-          <section className="grid uploadLayout">
-            <section className="card pageCard">
-              <span className="eyebrow">Upload</span>
-              <h2>Import local PDF</h2>
-              <p className="muted">Direct file import creates a local paper record and a queued parse state.</p>
-              <input value={filePath} onChange={(event) => setFilePath(event.target.value)} placeholder="C:/path/to/paper.pdf" />
-              {filePath ? (
-                <div className="selectedFileCard">
-                  <strong>{getFileNameFromPath(filePath)}</strong>
-                  <span>{filePath}</span>
+          <section className="uploadPageScroll uploadPageScrollCompact">
+            <section className="grid uploadLayout uploadLayoutCompact">
+              <section className="card pageCard uploadCardCompact">
+                <span className="eyebrow">Upload</span>
+                <h2>Import local PDF</h2>
+                <p className="muted">Direct file import creates a local paper record and a queued parse state.</p>
+                <input value={filePath} onChange={(event) => setFilePath(event.target.value)} placeholder="C:/path/to/paper.pdf" />
+                {filePath ? (
+                  <div className="selectedFileCard selectedFileCardCompact">
+                    <strong>{getFileNameFromPath(filePath)}</strong>
+                    <span>{filePath}</span>
+                  </div>
+                ) : (
+                  <div className="selectedFileCard selectedFileCardEmpty selectedFileCardCompact">
+                    <strong>No PDF selected</strong>
+                    <span>Choose a local PDF with the system dialog or paste a path manually.</span>
+                  </div>
+                )}
+                <div className="row rowWrap uploadActionsCompact">
+                  <button className="secondaryButton" onClick={() => void handlePickPdfFile()}>Choose PDF</button>
+                  <button className="secondaryButton" onClick={handleClearSelectedFile} disabled={!filePath}>Clear</button>
+                  <button onClick={() => void handleImportFile()}>Import PDF</button>
                 </div>
-              ) : (
-                <div className="selectedFileCard selectedFileCardEmpty">
-                  <strong>No PDF selected</strong>
-                  <span>Choose a local PDF with the system dialog or paste a path manually.</span>
+              </section>
+
+              <section className="card pageCard uploadCardCompact" id="import-by-url">
+                <span className="eyebrow">Link import</span>
+                <h2>Import by URL</h2>
+                <p className="muted">Paste a direct PDF link or use a search result as a starting point.</p>
+                <input value={paperUrl} onChange={(event) => setPaperUrl(event.target.value)} placeholder="https://example.org/paper.pdf" />
+                <button onClick={() => void handleImportLink()}>Import from link</button>
+              </section>
+
+              <section className="card pageCard uploadWideCard uploadCardCompact uploadMetadataCardCompact">
+                <span className="eyebrow">Metadata confirmation</span>
+                <h2>Confirm paper metadata</h2>
+                <p className="muted">Use this after link import or local upload to replace placeholder titles and seed Reader context.</p>
+                <div className="formGrid uploadFormGridCompact">
+                  <input value={metadataDraft.paperId} onChange={(event) => setMetadataDraft({ ...metadataDraft, paperId: event.target.value })} placeholder="paper id" />
+                  <input value={metadataDraft.title} onChange={(event) => setMetadataDraft({ ...metadataDraft, title: event.target.value })} placeholder="title" />
+                  <input value={metadataDraft.authors} onChange={(event) => setMetadataDraft({ ...metadataDraft, authors: event.target.value })} placeholder="authors, comma separated" />
+                  <input value={metadataDraft.year} onChange={(event) => setMetadataDraft({ ...metadataDraft, year: event.target.value })} placeholder="year" />
+                  <input value={metadataDraft.venue} onChange={(event) => setMetadataDraft({ ...metadataDraft, venue: event.target.value })} placeholder="venue" />
+                  <input value={metadataDraft.abstract} onChange={(event) => setMetadataDraft({ ...metadataDraft, abstract: event.target.value })} placeholder="abstract" />
                 </div>
-              )}
-              <div className="row rowWrap">
-                <button className="secondaryButton" onClick={() => void handlePickPdfFile()}>Choose PDF</button>
-                <button className="secondaryButton" onClick={handleClearSelectedFile} disabled={!filePath}>Clear</button>
-                <button onClick={() => void handleImportFile()}>Import PDF</button>
-              </div>
-            </section>
-
-            <section className="card pageCard">
-              <span className="eyebrow">Link import</span>
-              <h2>Import by URL</h2>
-              <p className="muted">Paste a direct PDF link or use a search result as a starting point.</p>
-              <input value={paperUrl} onChange={(event) => setPaperUrl(event.target.value)} placeholder="https://example.org/paper.pdf" />
-              <button onClick={() => void handleImportLink()}>Import from link</button>
-            </section>
-
-            <section className="card pageCard uploadWideCard">
-              <span className="eyebrow">Metadata confirmation</span>
-              <h2>Confirm paper metadata</h2>
-              <p className="muted">Use this after link import or local upload to replace placeholder titles and seed Reader context.</p>
-              <div className="formGrid">
-                <input value={metadataDraft.paperId} onChange={(event) => setMetadataDraft({ ...metadataDraft, paperId: event.target.value })} placeholder="paper id" />
-                <input value={metadataDraft.title} onChange={(event) => setMetadataDraft({ ...metadataDraft, title: event.target.value })} placeholder="title" />
-                <input value={metadataDraft.authors} onChange={(event) => setMetadataDraft({ ...metadataDraft, authors: event.target.value })} placeholder="authors, comma separated" />
-                <input value={metadataDraft.year} onChange={(event) => setMetadataDraft({ ...metadataDraft, year: event.target.value })} placeholder="year" />
-                <input value={metadataDraft.venue} onChange={(event) => setMetadataDraft({ ...metadataDraft, venue: event.target.value })} placeholder="venue" />
-                <input value={metadataDraft.abstract} onChange={(event) => setMetadataDraft({ ...metadataDraft, abstract: event.target.value })} placeholder="abstract" />
-              </div>
-              <div className="row rowEnd">
-                <button className="secondaryButton" onClick={() => void handleConfirmMetadata()}>Confirm metadata</button>
-              </div>
+                <div className="row rowEnd uploadActionsCompact">
+                  <button className="secondaryButton" onClick={() => void handleConfirmMetadata()}>Confirm metadata</button>
+                </div>
+              </section>
             </section>
           </section>
         ) : null}
 
         {activeView === 'reader' ? (
           <section className="card pageCard pageCardReaderModern">
-            <div className="sectionHeader">
-              <div>
+            <div className="sectionHeader sectionHeaderCompact readerHeaderCompact">
+              <div className="readerHeaderIntro">
                 <span className="eyebrow">Reader</span>
                 <h2>Paper workspace</h2>
-                <p className="muted">Read the original paper on the left and review the current agent output on the right.</p>
               </div>
-              <div className="row rowWrap readerHeaderActions">
-                <label className="detailLabel" htmlFor="agent-visual-mode-select">Visual mode</label>
-                <select
-                  id="agent-visual-mode-select"
-                  value={agentVisualMode}
-                  onChange={(event) => setAgentVisualMode(event.target.value)}
-                >
-                  <option value="disabled">Disabled</option>
-                  <option value="index_only">Index only</option>
-                  <option value="on_demand">On demand</option>
-                </select>
-                {readerSnapshot?.allowedActions.includes('run_quick_read') ? <button onClick={() => void handleRunAgent('quick_read')}>Quick read</button> : null}
-                {readerSnapshot?.allowedActions.includes('run_careful_read') ? <button onClick={() => void handleRunAgent('careful_read')}>Careful read</button> : null}
-                {readerSnapshot?.allowedActions.includes('run_deep_read') ? <button onClick={() => void handleRunAgent('deep_read')}>Deep read</button> : null}
-                {readerSnapshot?.allowedActions.includes('run_summary') ? <button onClick={() => void handleRunAgent('summary')}>Summary</button> : null}
-                <button
-                  className="secondaryButton"
-                  onClick={() => setActiveView('visuals')}
-                  disabled={!selectedPaperId}
-                >
-                  Open visual artifacts
-                </button>
-                <button className="secondaryButton" onClick={() => void handleReparsePaper()} disabled={!selectedPaperId}>Reparse paper</button>
-                <button onClick={() => void handleRefreshParseStatus()} disabled={!selectedPaperId}>Refresh status</button>
+              <div className="readerToolbarCompact">
+                <div className="readerToolbarMode">
+                  <label className="detailLabel" htmlFor="agent-visual-mode-select">Visual mode</label>
+                  <select
+                    id="agent-visual-mode-select"
+                    value={agentVisualMode}
+                    onChange={(event) => setAgentVisualMode(event.target.value)}
+                  >
+                    <option value="disabled">Disabled</option>
+                    <option value="index_only">Index only</option>
+                    <option value="on_demand">On demand</option>
+                  </select>
+                </div>
+                <div className="readerHeaderActionsCompact">
+                  {workflowPrimaryAction ? (
+                    <button onClick={() => void handleRunAgent(workflowPrimaryAction.agent)}>{workflowPrimaryAction.label}</button>
+                  ) : null}
+                  <button
+                    className="secondaryButton"
+                    onClick={() => setActiveView('visuals')}
+                    disabled={!selectedPaperId}
+                  >
+                    Visuals
+                  </button>
+                  <button className="secondaryButton" onClick={() => void handleReparsePaper()} disabled={!selectedPaperId}>Reparse</button>
+                  <button onClick={() => void handleRefreshParseStatus()} disabled={!selectedPaperId}>Refresh</button>
+                </div>
               </div>
             </div>
             {readerSnapshot ? (
               <>
-                <div className="workflowStrip">
-                  <article className="workflowStripCard">
+                <div className="workflowStrip workflowStripCompact">
+                  <article className="workflowStripCard workflowStripCardCompact">
                     <span className="detailLabel">Parse</span>
-                    <strong>{formatParseStatus(readerSnapshot.parseStatus)}</strong>
+                    <strong>{formatParseStatus(displayedParseStatus)}</strong>
                   </article>
-                  <article className="workflowStripCard">
+                  <article className="workflowStripCard workflowStripCardCompact">
                     <span className="detailLabel">Progress</span>
-                    <strong>{readerSnapshot.parseProgress}%</strong>
+                    <strong>{displayedParseProgress}%</strong>
                   </article>
-                  <article className="workflowStripCard">
+                  <article className="workflowStripCard workflowStripCardCompact workflowStripCardWide">
                     <span className="detailLabel">Current step</span>
-                    <strong>{formatWorkflowStep(readerSnapshot.workflowCurrentStep)}</strong>
+                    <strong>{formatWorkflowStep(displayedWorkflowStep)}</strong>
                   </article>
-                  <article className="workflowStripCard">
-                    <span className="detailLabel">Next action</span>
-                    <strong>{formatActionLabel(readerSnapshot.nextActionRequired) ?? 'None'}</strong>
+                  <article className="workflowStripCard workflowStripCardCompact">
+                    <span className="detailLabel">Next</span>
+                    <strong>{formatActionLabel(displayedNextAction) ?? 'None'}</strong>
                   </article>
-                  <article className="workflowStripCard">
+                  <article className="workflowStripCard workflowStripCardCompact">
                     <span className="detailLabel">Library</span>
                     <strong>{formatLibraryStatus(readerSnapshot.libraryStatus)}</strong>
                   </article>
@@ -980,39 +1029,7 @@ export function App() {
                   </section>
 
                   <section className="readerAgentPane">
-                    <div className="readerPaneHeader">
-                      <div>
-                        <span className="eyebrow">Analysis</span>
-                        <strong>Current agent output</strong>
-                        <p className="muted">This panel focuses on the latest reading result instead of workflow state.</p>
-                      </div>
-                    </div>
-
                     <div className="readerAgentBody">
-                      {readerSnapshot.activeRun ? (
-                        <section className="readerPanel">
-                          <span className="detailLabel">Running now</span>
-                          <strong>{readerSnapshot.activeRun.agentType}</strong>
-                          <span>Status: {readerSnapshot.activeRun.status}</span>
-                          <span>Batch {readerSnapshot.activeRun.currentBatchIndex} / {readerSnapshot.activeRun.currentBatchCount}</span>
-                          {readerSnapshot.activeRun.stageState ? renderStageState(readerSnapshot.activeRun.stageState) : null}
-                          {readerSnapshot.activeRun.actionHistory.length > 0 ? (
-                            <div className="detailGroup">
-                              <span className="detailLabel">Recent actions</span>
-                              <div className="runtimeHistoryList">
-                                {readerSnapshot.activeRun.actionHistory.slice(-3).reverse().map((item, index) => (
-                                  <article className="runtimeHistoryCard" key={`active-${item.iteration}-${index}`}>
-                                    {renderActionHistoryItem(item)}
-                                  </article>
-                                ))}
-                              </div>
-                            </div>
-                          ) : null}
-                          <span>Sections: {readerSnapshot.activeRun.contextPlan.selectedSectionIds.join(', ') || 'none'}</span>
-                          <span>Mode: {readerSnapshot.activeRun.contextPlan.runtimeMode} / {readerSnapshot.activeRun.contextPlan.sectionStrategy}</span>
-                        </section>
-                      ) : null}
-
                       {readerSnapshot.latestAgentRuns.length > 0 ? (
                         <section className="readerRunSwitcher">
                           <span className="detailLabel">Recent runs</span>
@@ -1040,30 +1057,7 @@ export function App() {
                           <div className="runCard">
                             <strong>{activeRun.agentType}</strong>
                             <span>Status: {activeRun.status}</span>
-                            <span>Finished: {activeRun.finishedAt ?? 'n/a'}</span>
-                            {activeRun.contextPlan ? (
-                              <div className="detailGroup">
-                                <span className="detailLabel">Context plan</span>
-                                <span>Mode: {activeRun.contextPlan.runtimeMode}</span>
-                                <span>Strategy: {activeRun.contextPlan.sectionStrategy}</span>
-                                <span>Visuals: {activeRun.contextPlan.visualMode}</span>
-                                <p>{activeRun.contextPlan.selectionReason}</p>
-                                <span>Sections: {activeRun.contextPlan.selectedSectionIds.join(', ') || 'none'}</span>
-                              </div>
-                            ) : null}
-                            {activeRun.stageState ? renderStageState(activeRun.stageState) : null}
-                            {activeRun.actionHistory.length > 0 ? (
-                              <div className="detailGroup">
-                                <span className="detailLabel">Action history</span>
-                                <div className="runtimeHistoryList">
-                                  {activeRun.actionHistory.slice().reverse().map((item, index) => (
-                                    <article className="runtimeHistoryCard" key={`detail-${item.iteration}-${index}`}>
-                                      {renderActionHistoryItem(item)}
-                                    </article>
-                                  ))}
-                                </div>
-                              </div>
-                            ) : null}
+                            <span>{activeRun.finishedAt ? `Finished: ${activeRun.finishedAt}` : `Started: ${activeRun.startedAt ?? 'unknown'}`}</span>
                             {activeRun.status === 'failed' ? (
                               <div className="detailGroup">
                                 <span className="detailLabel">Failure details</span>
@@ -1152,7 +1146,7 @@ export function App() {
             </div>
             {readerSnapshot ? (
               <div className="visualsPageLayout">
-                <section className="readerPanel">
+                <section className="readerPanel readerPanelScrollable">
                   <span className="eyebrow">Overview</span>
                   <strong>
                     Figures {readerSnapshot.parsedContent?.figureCount ?? parseStatus?.visualParsing?.figureCount ?? 0} · Tables {readerSnapshot.parsedContent?.tableCount ?? parseStatus?.visualParsing?.tableCount ?? 0}
@@ -1371,7 +1365,7 @@ export function App() {
               <input value={libraryKeyword} onChange={(event) => setLibraryKeyword(event.target.value)} placeholder="Search title or abstract" />
               <button className="secondaryButton" onClick={() => void handleApplyLibraryFilters()}>Apply filters</button>
             </div>
-            <div className="list">
+            <div className="list libraryListScroll">
               {libraryItems.length > 0 ? (
                 libraryItems.map((item) => (
                   <article className="listItem" key={item.id}>
@@ -1664,7 +1658,9 @@ function displayVisualSummary(
 }
 
 function renderVisualDiagnostics(items: VisualDiagnostic[]) {
-  if (!items.length) {
+  const visibleItems = items.filter((item) => item.code !== 'github_upload_succeeded');
+
+  if (!visibleItems.length) {
     return null;
   }
 
@@ -1672,7 +1668,7 @@ function renderVisualDiagnostics(items: VisualDiagnostic[]) {
     <div className="detailGroup">
       <span className="detailLabel">Visual diagnostics</span>
       <div className="evidenceList">
-        {items.map((item, index) => (
+        {visibleItems.map((item, index) => (
           <article className="evidenceCard" key={`${item.scope}-${item.code}-${index}`}>
             <strong>{item.code}</strong>
             <span>{item.scope} · {item.retryable ? 'retryable' : 'non-retryable'}</span>
@@ -1685,7 +1681,9 @@ function renderVisualDiagnostics(items: VisualDiagnostic[]) {
 }
 
 function renderGitHubUploadDiagnostics(items: VisualDiagnostic[]) {
-  if (!items.length) {
+  const visibleItems = items.filter((item) => item.code === 'github_upload_failed');
+
+  if (!visibleItems.length) {
     return null;
   }
 
@@ -1693,9 +1691,9 @@ function renderGitHubUploadDiagnostics(items: VisualDiagnostic[]) {
     <div className="detailGroup">
       <span className="detailLabel">GitHub upload status</span>
       <div className="evidenceList">
-        {items.map((item, index) => (
+        {visibleItems.map((item, index) => (
           <article className="evidenceCard" key={`${item.scope}-${item.code}-${index}`}>
-            <strong>{item.code === 'github_upload_succeeded' ? 'upload succeeded' : 'upload failed'}</strong>
+            <strong>upload failed</strong>
             <span>{item.scope} · {item.retryable ? 'retryable' : 'non-retryable'}</span>
             <p>{item.message}</p>
           </article>
@@ -1720,10 +1718,92 @@ function formatParseStatus(status: string | null) {
   }
 }
 
+function deriveRunParseStatus(status: string) {
+  switch (status) {
+    case 'queued':
+      return 'queued';
+    case 'running':
+      return 'running';
+    case 'succeeded':
+      return 'succeeded';
+    case 'failed':
+      return 'failed';
+    default:
+      return status;
+  }
+}
+
+function deriveRunProgress(run: AgentRunDetail, tick: number) {
+  switch (run.status) {
+    case 'queued':
+      return 0;
+    case 'running': {
+      const batchCount = Math.max(run.contextPlan?.batchCount ?? 1, 1);
+      const currentBatchIndex = Math.max(run.contextPlan?.currentBatchIndex ?? 0, 0);
+      const completedBatches = Math.min(currentBatchIndex, Math.max(batchCount - 1, 0));
+      const completedRatio = batchCount > 1 ? completedBatches / batchCount : 0;
+      const baseProgress = batchCount > 1 ? Math.round(completedRatio * 70) : 18;
+      const targetProgress = batchCount > 1
+        ? Math.min(92, Math.round(((completedBatches + 1) / batchCount) * 92))
+        : 92;
+      const animatedProgress = baseProgress + 12 + tick * 2;
+      return Math.min(targetProgress, animatedProgress);
+    }
+    case 'succeeded':
+      return 100;
+    case 'failed':
+      return 96;
+    default:
+      return 0;
+  }
+}
+
+function deriveRunWorkflowStep(agentType: string, status: string) {
+  if (status === 'running') {
+    return `${agentType}_running`;
+  }
+
+  if (status === 'succeeded') {
+    return `${agentType}_completed`;
+  }
+
+  if (status === 'failed') {
+    return 'workflow_blocked';
+  }
+
+  return null;
+}
+
+function deriveRunNextAction(status: string) {
+  switch (status) {
+    case 'queued':
+    case 'running':
+      return 'refresh_status';
+    case 'failed':
+      return 'refresh_status';
+    case 'succeeded':
+      return null;
+    default:
+      return null;
+  }
+}
+
 function formatWorkflowStep(step: string | null) {
   switch (step) {
     case 'paper_ready':
       return 'Paper ready';
+    case 'copy_file':
+      return 'Copying file';
+    case 'extract_text':
+      return 'Extracting text';
+    case 'extract_sections':
+      return 'Extracting sections';
+    case 'persist_result':
+      return 'Persisting result';
+    case 'succeeded':
+      return 'Completed';
+    case 'failed':
+      return 'Failed';
     case 'quick_read_running':
       return 'Quick read running';
     case 'quick_read_completed':
@@ -1770,6 +1850,36 @@ function formatActionLabel(action: string | null) {
     default:
       return action;
   }
+}
+
+function resolveWorkflowPrimaryAction(
+  readerSnapshot: ReaderSnapshot | null,
+  actions: typeof workflowPrimaryActions,
+) {
+  if (!readerSnapshot) {
+    return undefined;
+  }
+
+  const latestRun = readerSnapshot.latestAgentRuns[0];
+  if (latestRun && ['quick_read', 'careful_read', 'deep_read'].includes(latestRun.agentType)) {
+    if (latestRun.status === 'running' || latestRun.status === 'failed') {
+      return actions.find((item) => item.agent === latestRun.agentType);
+    }
+  }
+
+  const requiredAgents = ['quick_read', 'careful_read', 'deep_read'];
+  const completedAgents = new Set(
+    readerSnapshot.latestAgentRuns
+      .filter((run) => requiredAgents.includes(run.agentType) && run.status === 'succeeded')
+      .map((run) => run.agentType),
+  );
+
+  const allCoreAgentsCompleted = requiredAgents.every((agentType) => completedAgents.has(agentType));
+  if (allCoreAgentsCompleted && readerSnapshot.allowedActions.includes('run_summary')) {
+    return actions.find((item) => item.action === 'run_summary');
+  }
+
+  return actions.find((item) => readerSnapshot.allowedActions.includes(item.action) && item.action !== 'run_summary');
 }
 
 function formatLibraryStatus(status: string | null) {
@@ -1838,104 +1948,4 @@ function renderRunSnapshot(outputSnapshot: string | null) {
 function formatEvidenceMeta(item: EvidenceItem) {
   const page = item.page ? `Page ${item.page}` : 'Page n/a';
   return `${page} · ${item.locator}`;
-}
-
-function renderStageState(stageState: StageState) {
-  return (
-    <div className="detailGroup">
-      <span className="detailLabel">Loop state</span>
-      <span>{stageState.stage} · iteration {stageState.iteration} / {stageState.maxIterations}</span>
-      <p>{stageState.goal}</p>
-      <span>Enough evidence: {stageState.enough ? 'yes' : 'no'}</span>
-      {stageState.allowedActions.length > 0 ? (
-        <span>Allowed actions: {stageState.allowedActions.join(', ')}</span>
-      ) : null}
-      {stageState.checks.length > 0 ? (
-        <div className="runtimeChecklist">
-          {stageState.checks.map((item) => (
-            <article className={`runtimeCheckCard runtimeCheckCard${formatRuntimeCheckStatus(item.status)}`} key={item.id}>
-              {renderStageCheckItem(item)}
-            </article>
-          ))}
-        </div>
-      ) : null}
-      {stageState.openQuestions.length > 0 ? (
-        <div className="detailGroup">
-          <span className="detailLabel">Open questions</span>
-          <ul className="detailList">
-            {stageState.openQuestions.map((item) => (
-              <li key={item}>{item}</li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-      {stageState.visitedSources.length > 0 ? (
-        <span>Visited sources: {stageState.visitedSources.join(', ')}</span>
-      ) : null}
-    </div>
-  );
-}
-
-function renderStageCheckItem(item: StageCheckItem) {
-  return (
-    <>
-      <strong>{item.label}</strong>
-      <span>Status: {item.status}{item.required ? '' : ' · optional'}</span>
-      {item.note ? <p>{item.note}</p> : null}
-      {item.evidenceSourceIds.length > 0 ? (
-        <span>Evidence: {item.evidenceSourceIds.join(', ')}</span>
-      ) : null}
-    </>
-  );
-}
-
-function renderActionHistoryItem(item: ActionHistoryItem) {
-  return (
-    <>
-      <strong>Iteration {item.iteration}</strong>
-      <span>Action: {stringifyDecisionField(item.decision.action) ?? stringifyJsonValue(item.resolvedAction.action) ?? 'unknown'}</span>
-      {stringifyDecisionField(item.decision.reason) ? <p>{stringifyDecisionField(item.decision.reason)}</p> : null}
-      {stringifyJsonValue(item.resolvedAction.targetId) ? <span>Target: {stringifyJsonValue(item.resolvedAction.targetId)}</span> : null}
-      {item.outputSummary != null ? <span>Output: {stringifyJsonValue(item.outputSummary)}</span> : null}
-    </>
-  );
-}
-
-function formatRuntimeCheckStatus(status: string) {
-  switch (status) {
-    case 'done':
-      return 'Done';
-    case 'blocked':
-      return 'Blocked';
-    default:
-      return 'Todo';
-  }
-}
-
-function stringifyDecisionField(value: unknown) {
-  if (typeof value === 'string' && value.trim()) {
-    return value;
-  }
-
-  return null;
-}
-
-function stringifyJsonValue(value: unknown) {
-  if (value == null) {
-    return null;
-  }
-
-  if (typeof value === 'string') {
-    return value;
-  }
-
-  if (typeof value === 'number' || typeof value === 'boolean') {
-    return String(value);
-  }
-
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return null;
-  }
 }

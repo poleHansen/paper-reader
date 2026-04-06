@@ -1096,10 +1096,7 @@ async fn prepare_visual_input(
         Ok(uploaded) => Ok(PreparedVisualInput {
             resolved_image_path,
             remote_image_url: Some(uploaded.public_url.clone()),
-            upload_warning: Some(format!(
-                "{} github upload succeeded: {} -> {}",
-                artifact_scope, uploaded.repository_path, uploaded.public_url
-            )),
+            upload_warning: None,
             upload_diagnostic: Some(VisualDiagnostic {
                 scope: artifact_scope.to_string(),
                 code: "github_upload_succeeded".into(),

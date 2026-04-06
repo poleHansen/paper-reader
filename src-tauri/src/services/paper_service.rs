@@ -1,6 +1,6 @@
-use std::{path::Path, sync::Arc};
+use std::{net::IpAddr, path::Path, sync::Arc};
 
-use reqwest::header::CONTENT_TYPE;
+use reqwest::{header::CONTENT_TYPE, Url};
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
@@ -77,12 +77,11 @@ impl PaperService {
         request: ImportPaperFromLinkRequest,
     ) -> Result<ImportPaperFromFileResponse, AppError> {
         let url = request.url.trim();
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Err(AppError::Validation("url must start with http:// or https://".into()));
-        }
+        let parsed_url = parse_and_validate_import_url(url)?;
+        let download_url = resolve_import_url(&parsed_url);
 
         let response = reqwest::Client::new()
-            .get(url)
+            .get(download_url.clone())
             .send()
             .await
             .map_err(|error| AppError::UpstreamUnavailable(error.to_string()))?;
@@ -99,7 +98,7 @@ impl PaperService {
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .unwrap_or("");
-        let looks_like_pdf = content_type.contains("application/pdf") || url.to_ascii_lowercase().ends_with(".pdf");
+        let looks_like_pdf = content_type.contains("application/pdf") || download_url.path().to_ascii_lowercase().ends_with(".pdf");
         if !looks_like_pdf {
             return Err(AppError::Validation("url does not point to a pdf resource".into()));
         }
@@ -124,7 +123,7 @@ impl PaperService {
         let file_name = request
             .file_name
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| default_file_name_from_url(url));
+            .unwrap_or_else(|| default_file_name_from_url(download_url.as_str()));
         let staged_path = temp_dir.join(format!("{}.pdf", Uuid::new_v4().simple()));
         tokio::fs::write(&staged_path, &bytes)
             .await
@@ -209,4 +208,66 @@ fn default_file_name_from_url(url: &str) -> String {
         return trimmed.to_string();
     }
     format!("{trimmed}.pdf")
+}
+
+fn parse_and_validate_import_url(url: &str) -> Result<Url, AppError> {
+    let parsed = Url::parse(url).map_err(|_| AppError::Validation("url must start with http:// or https://".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(AppError::Validation("url must start with http:// or https://".into()));
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| AppError::Validation("url host is missing".into()))?;
+    if is_forbidden_import_host(host) {
+        return Err(AppError::Validation("local and private network URLs are not allowed".into()));
+    }
+
+    Ok(parsed)
+}
+
+fn is_forbidden_import_host(host: &str) -> bool {
+    let normalized = host.trim().to_ascii_lowercase();
+    if normalized == "localhost" || normalized.ends_with(".localhost") {
+        return true;
+    }
+
+    if let Ok(ip) = normalized.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(ipv4) => {
+                ipv4.is_private() || ipv4.is_loopback() || ipv4.is_link_local() || ipv4.is_unspecified() || ipv4.is_broadcast()
+            }
+            IpAddr::V6(ipv6) => ipv6.is_loopback() || ipv6.is_unspecified() || ipv6.is_unique_local(),
+        };
+    }
+
+    normalized.ends_with(".local")
+}
+
+fn resolve_import_url(parsed: &Url) -> Url {
+    if let Some(arxiv_id) = extract_arxiv_id_from_url(parsed) {
+        if let Ok(url) = Url::parse(&format!("https://arxiv.org/pdf/{arxiv_id}.pdf")) {
+            return url;
+        }
+    }
+
+    parsed.clone()
+}
+
+fn extract_arxiv_id_from_url(parsed: &Url) -> Option<String> {
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if host != "arxiv.org" && host != "www.arxiv.org" {
+        return None;
+    }
+
+    let path = parsed.path();
+    let raw = path
+        .strip_prefix("/abs/")
+        .or_else(|| path.strip_prefix("/pdf/"))?;
+    let candidate = raw.trim_end_matches(".pdf").trim_matches('/');
+    if candidate.is_empty() {
+        return None;
+    }
+
+    Some(candidate.to_string())
 }

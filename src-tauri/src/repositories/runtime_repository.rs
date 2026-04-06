@@ -2292,6 +2292,9 @@ fn collect_visual_findings_from_figure(figure: &crate::models::parsed_content::P
             findings.push(summary.clone());
         }
     }
+    if let Some(panel_count) = figure.panel_count.filter(|count| *count > 1) {
+        findings.push(format!("Detected {} sub-panels within the figure crop.", panel_count));
+    }
     if let Some(first_mention) = figure.mentions.first() {
         findings.push(first_mention.sentence.clone());
     }
@@ -2300,7 +2303,7 @@ fn collect_visual_findings_from_figure(figure: &crate::models::parsed_content::P
             findings.push(nearby.text.clone());
         }
     }
-    findings.truncate(3);
+    findings.truncate(4);
     findings
 }
 
