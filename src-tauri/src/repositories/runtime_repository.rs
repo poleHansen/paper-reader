@@ -1,7 +1,7 @@
 use std::{fs, sync::Arc};
 
 use rusqlite::OptionalExtension;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{io::AsyncWriteExt, process::Command};
 use uuid::Uuid;
@@ -11,13 +11,16 @@ use crate::{
     models::{
         model::StoredModelConfig,
         paper::ActiveAgentRunResponse,
-        parsed_content::{ParsedPaperContent, ParsedSection},
+        parsed_content::{ParsedFigure, ParsedPaperContent, ParsedSection, ParsedTable, ParsedVisualEvidence},
         runtime::{
-            AgentRunDetailResponse, AgentRunSummary, ContextBatch, ContextPlan, EvidenceItem,
-            GetAgentRunRequest, HandoffSummaryResponse, RunAgentRequest, RunAgentResponse,
+            AgentRunDetailResponse, AgentRunSummary, AnalyzeVisualsRequest, AnalyzeVisualsResponse,
+            ContextBatch, ContextPlan, DecisionEnvelope, EvidenceItem, GetAgentRunRequest,
+            HandoffSummaryResponse, RunAgentRequest, RunAgentResponse, StageCheckItem, StageState,
+            VisualAnalysisEvidence, VisualAnalysisItem, VisualAnalysisTarget,
         },
     },
-    repositories::database::Database,
+    repositories::{database::Database, model_repository::ModelRepository},
+    services::{github_asset_service::GitHubAssetService, parse_service::analyze_visual_artifact_on_demand},
     utils::time::now_iso,
 };
 
@@ -28,6 +31,91 @@ pub struct RuntimeRepository {
 impl RuntimeRepository {
     pub fn new(database: Arc<Database>) -> Self {
         Self { database }
+    }
+
+    pub async fn analyze_visuals(&self, request: AnalyzeVisualsRequest) -> Result<AnalyzeVisualsResponse, AppError> {
+        let paper_context = load_visual_analysis_context(&self.database, &request.paper_id)?;
+        let parsed_content = load_parsed_content(paper_context.storage_path.as_deref())?;
+        let max_items = request.max_items.unwrap_or(4).max(1) as usize;
+        let requested_ids = request.target_object_ids.clone().unwrap_or_default();
+        let requested_types = request.target_object_types.clone().unwrap_or_default();
+        let request_question = request
+            .user_question
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let force = request.force.unwrap_or(false);
+
+        let runtime_model = ModelRepository::new(self.database.clone()).get_runtime_config("quick_read")?;
+        let github_asset_service = Arc::new(GitHubAssetService::new(self.database.clone()));
+
+        let mut targets = Vec::new();
+        let mut analyses = Vec::new();
+        let mut warnings = Vec::new();
+
+        for figure in select_visual_figures(&parsed_content, &requested_ids, &requested_types) {
+            if analyses.len() >= max_items {
+                break;
+            }
+            targets.push(VisualAnalysisTarget {
+                object_id: figure.id.clone(),
+                object_type: "figure".to_string(),
+            });
+            analyses.push(
+                build_figure_visual_analysis(
+                    figure,
+                    &request.stage,
+                    request_question.as_deref(),
+                    force,
+                    &runtime_model,
+                    github_asset_service.clone(),
+                    paper_context.paper_title.clone(),
+                )
+                .await,
+            );
+        }
+
+        if analyses.len() < max_items {
+            for table in select_visual_tables(&parsed_content, &requested_ids, &requested_types) {
+                if analyses.len() >= max_items {
+                    break;
+                }
+                targets.push(VisualAnalysisTarget {
+                    object_id: table.id.clone(),
+                    object_type: "table".to_string(),
+                });
+                analyses.push(
+                    build_table_visual_analysis(
+                        table,
+                        &request.stage,
+                        request_question.as_deref(),
+                        force,
+                        &runtime_model,
+                        github_asset_service.clone(),
+                        paper_context.paper_title.clone(),
+                    )
+                    .await,
+                );
+            }
+        }
+
+        if analyses.is_empty() {
+            warnings.push("No visual targets matched the requested ids/types for this paper.".to_string());
+        }
+
+        if request_question.is_some() {
+            warnings.push("On-demand visual analysis was scoped by the provided reader question.".to_string());
+        }
+
+        Ok(AnalyzeVisualsResponse {
+            paper_id: request.paper_id,
+            stage: request.stage,
+            visual_mode: "on_demand".to_string(),
+            targets,
+            analyses,
+            warnings,
+        })
     }
 
     pub fn seed_workflow_for_paper(&self, paper_id: &str, parse_status: &str) -> Result<(), AppError> {
@@ -155,6 +243,9 @@ impl RuntimeRepository {
                 )
                 .optional()?;
 
+            let stage_state = extract_stage_state_from_snapshot(&run.4);
+            let action_history = extract_action_history_from_snapshot(&run.4);
+
             Ok(AgentRunDetailResponse {
                 id: run.0,
                 paper_id: run.1,
@@ -164,6 +255,8 @@ impl RuntimeRepository {
                 output_snapshot: run.5,
                 handoff_summary: handoff,
                 context_plan: run.10,
+                stage_state,
+                action_history,
                 error_code: run.6,
                 error_message: run.7,
                 started_at: run.8,
@@ -229,6 +322,8 @@ impl RuntimeRepository {
                             current_batch_index: context_plan.current_batch_index,
                             current_batch_count: context_plan.batch_count,
                             context_plan,
+                            stage_state: extract_stage_state_from_snapshot(&input_snapshot),
+                            action_history: extract_action_history_from_snapshot(&input_snapshot),
                         })
                     },
                 )
@@ -357,6 +452,11 @@ impl RuntimeRepository {
             let planned_sections = planned_sections_for_snapshot(&parsed_content, &context_plan);
             let prompt_handoff_summaries = select_handoff_summaries(&handoff_summaries, &context_plan.used_handoff_summary_ids);
 
+            let stage_state = build_initial_stage_state(&request.agent_type, &context_plan, &prompt_handoff_summaries);
+            let planned_figures = planned_figures_for_snapshot(&parsed_content, &context_plan);
+            let planned_tables = planned_tables_for_snapshot(&parsed_content, &context_plan);
+            let planned_visual_evidence = planned_visual_evidence_for_snapshot(&parsed_content, &context_plan);
+
             let input_snapshot = json!({
                 "paper": {
                     "paperId": paper.paper_id,
@@ -380,6 +480,9 @@ impl RuntimeRepository {
                 "paperContent": {
                     "abstract": paper.abstract_text,
                     "sections": planned_sections,
+                    "figures": planned_figures,
+                    "tables": planned_tables,
+                    "visualEvidence": planned_visual_evidence,
                     "fullText": Value::Null,
                     "fullTextAvailable": paper.full_text_available,
                     "pageCount": paper.page_count,
@@ -396,6 +499,9 @@ impl RuntimeRepository {
                 "selectedHandoffSummaryIds": context_plan.used_handoff_summary_ids,
                 "batchCount": context_plan.batch_count,
                 "contextPlan": context_plan,
+                "sectionAccessPlan": context_plan,
+                "stageState": stage_state,
+                "actionHistory": [],
                 "runtimeModel": {
                     "provider": model_config.provider,
                     "modelName": model_config.model_name,
@@ -420,6 +526,7 @@ impl RuntimeRepository {
                 input_snapshot: input_snapshot.to_string(),
                 current_handoff_ids: workflow,
                 context_plan,
+                parsed_content,
                 prompt,
             })
         })
@@ -605,40 +712,144 @@ impl RuntimeRepository {
             return Err(AppError::Validation("runtime only supports openai_compatible models".into()));
         }
 
-        let mut batch_outputs = Vec::new();
         let mut aggregate_completion: Option<CompletionEnvelope> = None;
+        let mut latest_output: Option<Value> = None;
+        let mut action_history: Vec<Value> = Vec::new();
+        let mut stage_state = extract_stage_state_from_snapshot(&run_context.input_snapshot)
+            .unwrap_or_else(|| build_initial_stage_state(agent_type, &run_context.context_plan, &[]));
 
-        for batch in &run_context.context_plan.batches {
-            self.update_running_batch_progress(run_id, batch.batch_index)?;
-            let batch_prompt = build_batch_prompt(&run_context.prompt, batch);
-            let completion = request_model_completion(model_config, agent_type, &batch_prompt).await?;
-            let content = completion_content(&completion)?;
+        while !stage_state.enough && stage_state.iteration < stage_state.max_iterations {
+            let candidate_targets = list_candidate_targets(&run_context.parsed_content, &run_context.context_plan, &stage_state);
+            let (decision, decision_completion) = request_runtime_decision(
+                model_config,
+                agent_type,
+                &run_context.prompt,
+                &stage_state,
+                latest_output.as_ref(),
+                &action_history,
+                &candidate_targets,
+            )
+            .await?;
 
-            let (output, final_completion) = match parse_agent_output(agent_type, &content) {
-                Ok(output) => (output, completion),
-                Err(AppError::SchemaInvalid(error_message)) => {
-                    let repair_prompt = build_schema_repair_prompt(agent_type, &batch_prompt, &content, &error_message);
-                    let repair_completion = request_model_completion(model_config, agent_type, &repair_prompt).await?;
-                    let repair_content = completion_content(&repair_completion)?;
-                    let repaired_output = parse_agent_output(agent_type, &repair_content)?;
-                    (repaired_output, merge_usage(completion, repair_completion))
+            aggregate_completion = Some(match aggregate_completion.take() {
+                Some(previous) => merge_usage(previous, decision_completion),
+                None => decision_completion,
+            });
+
+            if decision.action == "finish" || decision.action == "blocked" {
+                let final_prompt = build_finish_final_output_prompt(
+                    &run_context.prompt,
+                    agent_type,
+                    &stage_state,
+                    latest_output.as_ref(),
+                    &action_history,
+                    &decision,
+                );
+                let (output, final_completion) = request_final_output(model_config, agent_type, &final_prompt).await?;
+                stage_state = apply_decision_to_stage_state(stage_state, &decision, None, Some(&output.output_json));
+                if decision.action == "blocked" {
+                    stage_state.enough = true;
                 }
-                Err(error) => return Err(error),
-            };
+                self.update_stage_state_snapshot(run_id, &stage_state)?;
+
+                let final_completion = match aggregate_completion.take() {
+                    Some(previous) => merge_usage(previous, final_completion),
+                    None => final_completion,
+                };
+
+                return Ok(AgentExecutionOutput {
+                    output_json: inject_stage_state_into_output(output.output_json, &stage_state),
+                    handoff_summary: output.handoff_summary,
+                    token_usage: final_completion.usage.map(|usage| json!({
+                        "promptTokens": usage.prompt_tokens,
+                        "completionTokens": usage.completion_tokens,
+                        "totalTokens": usage.total_tokens,
+                    })),
+                    cost_estimate: None,
+                });
+            }
+
+            let (decision, resolved_action, resolution_completion) = resolve_runtime_action_with_retry(
+                model_config,
+                agent_type,
+                &run_context.prompt,
+                &run_context.parsed_content,
+                &run_context.context_plan,
+                &stage_state,
+                latest_output.as_ref(),
+                &action_history,
+                &candidate_targets,
+                decision,
+            )
+            .await?;
+
+            if let Some(resolution_completion) = resolution_completion {
+                aggregate_completion = Some(match aggregate_completion.take() {
+                    Some(previous) => merge_usage(previous, resolution_completion),
+                    None => resolution_completion,
+                });
+            }
+
+            self.update_running_iteration_progress(run_id, &stage_state, resolved_action.batch_index)?;
+
+            let final_prompt = build_final_output_generation_prompt(
+                &run_context.prompt,
+                agent_type,
+                &stage_state,
+                latest_output.as_ref(),
+                &decision,
+                &resolved_action,
+                &action_history,
+            );
+            let (output, final_completion) = request_final_output(model_config, agent_type, &final_prompt).await?;
+
+            latest_output = Some(output.output_json.clone());
+            let decision_for_state = decision.clone();
+            action_history.push(json!({
+                "iteration": stage_state.iteration + 1,
+                "decision": decision,
+                "resolvedAction": resolved_action,
+                "outputSummary": output.output_json.get("summary").cloned().unwrap_or(Value::Null),
+            }));
+            stage_state = apply_decision_to_stage_state(
+                stage_state,
+                &decision_for_state,
+                Some(&resolved_action),
+                Some(&output.output_json),
+            );
+            self.update_stage_state_snapshot(run_id, &stage_state)?;
+            self.update_action_history_snapshot(run_id, &action_history)?;
 
             aggregate_completion = Some(match aggregate_completion.take() {
                 Some(previous) => merge_usage(previous, final_completion),
                 None => final_completion,
             });
-            batch_outputs.push(output.output_json);
         }
 
-        let merged_output = merge_batch_output_json(agent_type, &batch_outputs)?;
-        let output = normalize_agent_output(agent_type, merged_output)?;
-        let final_completion = aggregate_completion.ok_or_else(|| AppError::Internal("runtime executed zero batches".into()))?;
+        let final_prompt = build_finish_final_output_prompt(
+            &run_context.prompt,
+            agent_type,
+            &stage_state,
+            latest_output.as_ref(),
+            &action_history,
+            &DecisionEnvelope {
+                action: "finish".to_string(),
+                target: None,
+                reason: "Reached max iterations; finalize using collected evidence.".to_string(),
+                check_status: Vec::new(),
+                open_questions: stage_state.open_questions.clone(),
+            },
+        );
+        let (output, final_completion) = request_final_output(model_config, agent_type, &final_prompt).await?;
+        stage_state.enough = true;
+        self.update_stage_state_snapshot(run_id, &stage_state)?;
+        let final_completion = match aggregate_completion.take() {
+            Some(previous) => merge_usage(previous, final_completion),
+            None => final_completion,
+        };
 
         Ok(AgentExecutionOutput {
-            output_json: output.output_json,
+            output_json: inject_stage_state_into_output(output.output_json, &stage_state),
             handoff_summary: output.handoff_summary,
             token_usage: final_completion.usage.map(|usage| json!({
                 "promptTokens": usage.prompt_tokens,
@@ -649,7 +860,12 @@ impl RuntimeRepository {
         })
     }
 
-    fn update_running_batch_progress(&self, run_id: &str, current_batch_index: i32) -> Result<(), AppError> {
+    fn update_running_iteration_progress(
+        &self,
+        run_id: &str,
+        stage_state: &StageState,
+        current_batch_index: i32,
+    ) -> Result<(), AppError> {
         self.database.with_connection(|connection| {
             let input_snapshot: String = connection.query_row(
                 "SELECT input_snapshot_json FROM agent_runs WHERE id = ?1",
@@ -657,7 +873,45 @@ impl RuntimeRepository {
                 |row| row.get(0),
             )?;
 
-            let updated_snapshot = update_context_plan_current_batch_index(&input_snapshot, current_batch_index)?;
+            let updated_snapshot = update_stage_state_and_context_plan(&input_snapshot, stage_state, current_batch_index)?;
+
+            connection.execute(
+                "UPDATE agent_runs SET input_snapshot_json = ?1 WHERE id = ?2",
+                rusqlite::params![updated_snapshot, run_id],
+            )?;
+
+            Ok(())
+        })
+    }
+
+    fn update_stage_state_snapshot(&self, run_id: &str, stage_state: &StageState) -> Result<(), AppError> {
+        self.database.with_connection(|connection| {
+            let input_snapshot: String = connection.query_row(
+                "SELECT input_snapshot_json FROM agent_runs WHERE id = ?1",
+                rusqlite::params![run_id],
+                |row| row.get(0),
+            )?;
+
+            let updated_snapshot = update_stage_state_in_snapshot(&input_snapshot, stage_state)?;
+
+            connection.execute(
+                "UPDATE agent_runs SET input_snapshot_json = ?1 WHERE id = ?2",
+                rusqlite::params![updated_snapshot, run_id],
+            )?;
+
+            Ok(())
+        })
+    }
+
+    fn update_action_history_snapshot(&self, run_id: &str, action_history: &[Value]) -> Result<(), AppError> {
+        self.database.with_connection(|connection| {
+            let input_snapshot: String = connection.query_row(
+                "SELECT input_snapshot_json FROM agent_runs WHERE id = ?1",
+                rusqlite::params![run_id],
+                |row| row.get(0),
+            )?;
+
+            let updated_snapshot = update_action_history_in_snapshot(&input_snapshot, action_history)?;
 
             connection.execute(
                 "UPDATE agent_runs SET input_snapshot_json = ?1 WHERE id = ?2",
@@ -673,6 +927,7 @@ struct RunContext {
     input_snapshot: String,
     current_handoff_ids: Vec<String>,
     context_plan: ContextPlan,
+    parsed_content: ParsedPaperContent,
     prompt: String,
 }
 
@@ -1315,6 +1570,9 @@ fn build_context_plan(
     let backfill_reason = backfill_reason_for_agent(&request.agent_type, handoff_chain_complete, &gap_categories);
     let handoff_only = selected_sections.is_empty() && !selected_handoff_summaries.is_empty();
     let mut fallback_applied = false;
+    let visual_mode = request.visual_mode.clone().unwrap_or_else(|| "disabled".to_string());
+    let mut selected_figure_ids = request.pinned_figure_ids.clone().unwrap_or_default();
+    let mut selected_table_ids = request.pinned_table_ids.clone().unwrap_or_default();
 
     if let Some(pinned_section_ids) = request.pinned_section_ids.as_ref() {
         for section_id in pinned_section_ids {
@@ -1323,6 +1581,28 @@ fn build_context_plan(
             {
                 selected_sections.push(section_id.clone());
             }
+        }
+    }
+
+    selected_figure_ids.retain(|figure_id| parsed_content.figures.iter().any(|figure| &figure.id == figure_id));
+    selected_table_ids.retain(|table_id| parsed_content.tables.iter().any(|table| &table.id == table_id));
+
+    if visual_mode != "disabled" {
+        if selected_figure_ids.is_empty() {
+            selected_figure_ids = parsed_content
+                .figures
+                .iter()
+                .take(3)
+                .map(|figure| figure.id.clone())
+                .collect();
+        }
+        if selected_table_ids.is_empty() {
+            selected_table_ids = parsed_content
+                .tables
+                .iter()
+                .take(2)
+                .map(|table| table.id.clone())
+                .collect();
         }
     }
 
@@ -1353,8 +1633,8 @@ fn build_context_plan(
                 .filter_map(|section_id| parsed_content.sections.iter().find(|section| &section.id == section_id))
                 .map(|section| section.title.clone())
                 .collect(),
-            figure_ids: Vec::new(),
-            table_ids: Vec::new(),
+            figure_ids: selected_figure_ids.clone(),
+            table_ids: selected_table_ids.clone(),
             carry_in_summary_ids: used_handoff_summary_ids.clone(),
             prompt_budget_estimate: estimate_batch_prompt_budget(batch_sections, parsed_content),
         })
@@ -1374,10 +1654,10 @@ fn build_context_plan(
         backfill_reason,
         gap_categories,
         selected_section_ids: selected_sections,
-        selected_figure_ids: Vec::new(),
-        selected_table_ids: Vec::new(),
+        selected_figure_ids,
+        selected_table_ids,
         used_handoff_summary_ids,
-        visual_mode: "disabled".to_string(),
+        visual_mode,
         batch_count: batches.len() as i32,
         current_batch_index: 0,
         truncated: truncated_selected,
@@ -1786,11 +2066,312 @@ fn estimate_batch_prompt_budget(section_ids: &[String], parsed_content: &ParsedP
         .sum()
 }
 
+struct VisualAnalysisPaperContext {
+    paper_title: Option<String>,
+    storage_path: Option<String>,
+}
+
+fn load_visual_analysis_context(database: &Arc<Database>, paper_id: &str) -> Result<VisualAnalysisPaperContext, AppError> {
+    database.with_connection(|connection| {
+        connection
+            .query_row(
+                "SELECT p.title, a.storage_path
+                 FROM papers p
+                 LEFT JOIN parsed_paper_artifacts a ON a.paper_id = p.id
+                 WHERE p.id = ?1
+                 ORDER BY a.created_at DESC
+                 LIMIT 1",
+                rusqlite::params![paper_id],
+                |row| {
+                    Ok(VisualAnalysisPaperContext {
+                        paper_title: row.get::<_, Option<String>>(0)?,
+                        storage_path: row.get::<_, Option<String>>(1)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| AppError::NotFound("paper not found for visual analysis".into()))
+    })
+}
+
+fn select_visual_figures<'a>(
+    parsed_content: &'a ParsedPaperContent,
+    requested_ids: &[String],
+    requested_types: &[String],
+) -> Vec<&'a crate::models::parsed_content::ParsedFigure> {
+    parsed_content
+        .figures
+        .iter()
+        .filter(|figure| {
+            (requested_types.is_empty() || requested_types.iter().any(|item| item == "figure"))
+                && (requested_ids.is_empty() || requested_ids.iter().any(|item| item == &figure.id))
+        })
+        .collect()
+}
+
+fn select_visual_tables<'a>(
+    parsed_content: &'a ParsedPaperContent,
+    requested_ids: &[String],
+    requested_types: &[String],
+) -> Vec<&'a crate::models::parsed_content::ParsedTable> {
+    parsed_content
+        .tables
+        .iter()
+        .filter(|table| {
+            (requested_types.is_empty() || requested_types.iter().any(|item| item == "table"))
+                && (requested_ids.is_empty() || requested_ids.iter().any(|item| item == &table.id))
+        })
+        .collect()
+}
+
+async fn build_figure_visual_analysis(
+    figure: &crate::models::parsed_content::ParsedFigure,
+    stage: &str,
+    user_question: Option<&str>,
+    force: bool,
+    runtime_model: &StoredModelConfig,
+    github_asset_service: Arc<GitHubAssetService>,
+    paper_title: Option<String>,
+) -> VisualAnalysisItem {
+    let indexed_summary = figure.summary.clone();
+    let has_image_asset = figure.image_path.as_deref().map(|value| !value.trim().is_empty()).unwrap_or(false);
+    let multimodal = if has_image_asset && (force || indexed_summary.as_deref().map(|value| value.trim().is_empty()).unwrap_or(true)) {
+        analyze_visual_artifact_on_demand(
+            runtime_model.clone(),
+            github_asset_service,
+            "figure".to_string(),
+            figure.label.clone(),
+            figure.caption.clone(),
+            figure.image_path.clone().unwrap_or_default(),
+            paper_title,
+            user_question.map(str::to_string),
+        )
+        .await
+        .ok()
+    } else {
+        None
+    };
+
+    let multimodal_summary = multimodal
+        .as_ref()
+        .map(|outcome| outcome.summary.clone())
+        .or(indexed_summary.clone());
+
+    let mut warnings = Vec::new();
+    if let Some(warning) = multimodal.as_ref().and_then(|outcome| outcome.upload_warning.clone()) {
+        warnings.push(warning);
+    }
+    if !has_image_asset {
+        warnings.push("Skipped on-demand visual analysis because no object crop asset is available for this figure.".to_string());
+    } else if multimodal.is_none() && indexed_summary.is_some() {
+        warnings.push("Returned indexed visual summary because force=false and an existing figure summary was available.".to_string());
+    }
+
+    VisualAnalysisItem {
+        object_id: figure.id.clone(),
+        object_type: "figure".to_string(),
+        label: figure.label.clone(),
+        title: figure.title.clone(),
+        page: figure.page,
+        locator: figure.locator.clone(),
+        stage: stage.to_string(),
+        chart_type: infer_chart_type(figure.caption.as_str(), multimodal_summary.as_deref()),
+        multimodal_summary,
+        key_findings: collect_visual_findings_from_figure(figure),
+        evidence: vec![VisualAnalysisEvidence {
+            source_object_id: figure.id.clone(),
+            source_object_type: "figure".to_string(),
+            claim: figure.summary.clone().unwrap_or_else(|| figure.caption.clone()),
+            evidence_text: figure.caption.clone(),
+            page: figure.page,
+            locator: figure.locator.clone(),
+            confidence: figure.confidence,
+        }],
+        warnings,
+        confidence: figure.confidence,
+    }
+}
+
+async fn build_table_visual_analysis(
+    table: &crate::models::parsed_content::ParsedTable,
+    stage: &str,
+    user_question: Option<&str>,
+    force: bool,
+    runtime_model: &StoredModelConfig,
+    github_asset_service: Arc<GitHubAssetService>,
+    paper_title: Option<String>,
+) -> VisualAnalysisItem {
+    let indexed_summary = table.summary.clone();
+    let has_image_asset = table.image_path.as_deref().map(|value| !value.trim().is_empty()).unwrap_or(false);
+    let multimodal = if has_image_asset && (force || indexed_summary.as_deref().map(|value| value.trim().is_empty()).unwrap_or(true)) {
+        analyze_visual_artifact_on_demand(
+            runtime_model.clone(),
+            github_asset_service,
+            "table".to_string(),
+            table.label.clone(),
+            table.caption.clone(),
+            table.image_path.clone().unwrap_or_default(),
+            paper_title,
+            user_question.map(str::to_string),
+        )
+        .await
+        .ok()
+    } else {
+        None
+    };
+
+    let multimodal_summary = multimodal
+        .as_ref()
+        .map(|outcome| outcome.summary.clone())
+        .or(indexed_summary.clone())
+        .or_else(|| table.markdown_table.clone())
+        .or_else(|| Some(table.caption.clone()));
+
+    let mut warnings = Vec::new();
+    if let Some(warning) = multimodal.as_ref().and_then(|outcome| outcome.upload_warning.clone()) {
+        warnings.push(warning);
+    }
+    if !has_image_asset {
+        warnings.push("Skipped on-demand visual analysis because no object crop asset is available for this table.".to_string());
+    } else if multimodal.is_none() && indexed_summary.is_some() {
+        warnings.push("Returned indexed table summary because force=false and an existing table summary was available.".to_string());
+    }
+
+    VisualAnalysisItem {
+        object_id: table.id.clone(),
+        object_type: "table".to_string(),
+        label: table.label.clone(),
+        title: table.title.clone(),
+        page: table.page,
+        locator: table.locator.clone(),
+        stage: stage.to_string(),
+        chart_type: Some("table".to_string()),
+        multimodal_summary,
+        key_findings: collect_visual_findings_from_table(table),
+        evidence: vec![VisualAnalysisEvidence {
+            source_object_id: table.id.clone(),
+            source_object_type: "table".to_string(),
+            claim: table.summary.clone().unwrap_or_else(|| table.caption.clone()),
+            evidence_text: table.markdown_table.clone().unwrap_or_else(|| table.caption.clone()),
+            page: table.page,
+            locator: table.locator.clone(),
+            confidence: table.confidence,
+        }],
+        warnings,
+        confidence: table.confidence,
+    }
+}
+
+fn infer_chart_type(caption: &str, multimodal_summary: Option<&str>) -> Option<String> {
+    let joined = format!("{} {}", caption.to_ascii_lowercase(), multimodal_summary.unwrap_or_default().to_ascii_lowercase());
+    if joined.contains("bar chart") || joined.contains("bar plot") {
+        return Some("bar_chart".to_string());
+    }
+    if joined.contains("line chart") || joined.contains("line plot") || joined.contains("trend") {
+        return Some("line_chart".to_string());
+    }
+    if joined.contains("scatter") {
+        return Some("scatter_plot".to_string());
+    }
+    if joined.contains("heatmap") {
+        return Some("heatmap".to_string());
+    }
+    if joined.contains("ablation") {
+        return Some("ablation_chart".to_string());
+    }
+    None
+}
+
+fn collect_visual_findings_from_figure(figure: &crate::models::parsed_content::ParsedFigure) -> Vec<String> {
+    let mut findings = Vec::new();
+    if !figure.caption.trim().is_empty() {
+        findings.push(figure.caption.clone());
+    }
+    if let Some(summary) = figure.summary.as_ref() {
+        if !summary.trim().is_empty() && !findings.iter().any(|item| item == summary) {
+            findings.push(summary.clone());
+        }
+    }
+    if let Some(first_mention) = figure.mentions.first() {
+        findings.push(first_mention.sentence.clone());
+    }
+    if let Some(nearby) = figure.nearby_context.first() {
+        if !nearby.text.trim().is_empty() {
+            findings.push(nearby.text.clone());
+        }
+    }
+    findings.truncate(3);
+    findings
+}
+
+fn collect_visual_findings_from_table(table: &crate::models::parsed_content::ParsedTable) -> Vec<String> {
+    let mut findings = Vec::new();
+    if !table.caption.trim().is_empty() {
+        findings.push(table.caption.clone());
+    }
+    if let Some(summary) = table.summary.as_ref() {
+        if !summary.trim().is_empty() && !findings.iter().any(|item| item == summary) {
+            findings.push(summary.clone());
+        }
+    }
+    if let Some(first_mention) = table.mentions.first() {
+        findings.push(first_mention.sentence.clone());
+    }
+    if let Some(nearby) = table.nearby_context.first() {
+        if !nearby.text.trim().is_empty() {
+            findings.push(nearby.text.clone());
+        }
+    }
+    findings.truncate(3);
+    findings
+}
+
 fn planned_sections_for_snapshot(parsed_content: &ParsedPaperContent, context_plan: &ContextPlan) -> Vec<ParsedSection> {
     parsed_content
         .sections
         .iter()
         .filter(|section| context_plan.selected_section_ids.iter().any(|section_id| section_id == &section.id))
+        .cloned()
+        .collect()
+}
+
+fn planned_figures_for_snapshot(parsed_content: &ParsedPaperContent, context_plan: &ContextPlan) -> Vec<ParsedFigure> {
+    parsed_content
+        .figures
+        .iter()
+        .filter(|figure| context_plan.selected_figure_ids.iter().any(|figure_id| figure_id == &figure.id))
+        .cloned()
+        .collect()
+}
+
+fn planned_tables_for_snapshot(parsed_content: &ParsedPaperContent, context_plan: &ContextPlan) -> Vec<ParsedTable> {
+    parsed_content
+        .tables
+        .iter()
+        .filter(|table| context_plan.selected_table_ids.iter().any(|table_id| table_id == &table.id))
+        .cloned()
+        .collect()
+}
+
+fn planned_visual_evidence_for_snapshot(
+    parsed_content: &ParsedPaperContent,
+    context_plan: &ContextPlan,
+) -> Vec<ParsedVisualEvidence> {
+    parsed_content
+        .visual_evidence
+        .iter()
+        .filter(|item| {
+            (item.source_object_type == "figure"
+                && context_plan
+                    .selected_figure_ids
+                    .iter()
+                    .any(|selected_id| selected_id == &item.source_object_id))
+                || (item.source_object_type == "table"
+                    && context_plan
+                        .selected_table_ids
+                        .iter()
+                        .any(|selected_id| selected_id == &item.source_object_id))
+        })
         .cloned()
         .collect()
 }
@@ -1832,60 +2413,697 @@ fn update_context_plan_current_batch_index(snapshot: &str, current_batch_index: 
     serde_json::to_string(&snapshot_value).map_err(|error| AppError::Internal(error.to_string()))
 }
 
-fn build_batch_prompt(base_prompt: &str, batch: &ContextBatch) -> String {
+fn update_stage_state_in_snapshot(snapshot: &str, stage_state: &StageState) -> Result<String, AppError> {
+    let mut snapshot_value = serde_json::from_str::<Value>(snapshot)
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let snapshot_object = snapshot_value
+        .as_object_mut()
+        .ok_or_else(|| AppError::Internal("input snapshot must be a JSON object".into()))?;
+
+    snapshot_object.insert(
+        "stageState".into(),
+        serde_json::to_value(stage_state).map_err(|error| AppError::Internal(error.to_string()))?,
+    );
+
+    serde_json::to_string(&snapshot_value).map_err(|error| AppError::Internal(error.to_string()))
+}
+
+fn update_action_history_in_snapshot(snapshot: &str, action_history: &[Value]) -> Result<String, AppError> {
+    let mut snapshot_value = serde_json::from_str::<Value>(snapshot)
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let snapshot_object = snapshot_value
+        .as_object_mut()
+        .ok_or_else(|| AppError::Internal("input snapshot must be a JSON object".into()))?;
+
+    snapshot_object.insert("actionHistory".into(), Value::Array(action_history.to_vec()));
+
+    serde_json::to_string(&snapshot_value).map_err(|error| AppError::Internal(error.to_string()))
+}
+
+fn update_stage_state_and_context_plan(
+    snapshot: &str,
+    stage_state: &StageState,
+    current_batch_index: i32,
+) -> Result<String, AppError> {
+    let snapshot = update_stage_state_in_snapshot(snapshot, stage_state)?;
+    update_context_plan_current_batch_index(&snapshot, current_batch_index)
+}
+
+fn extract_stage_state_from_snapshot(input_snapshot: &str) -> Option<StageState> {
+    serde_json::from_str::<Value>(input_snapshot)
+        .ok()
+        .and_then(|value| value.get("stageState").cloned())
+        .and_then(|value| serde_json::from_value::<StageState>(value).ok())
+}
+
+fn extract_action_history_from_snapshot(input_snapshot: &str) -> Vec<Value> {
+    serde_json::from_str::<Value>(input_snapshot)
+        .ok()
+        .and_then(|value| value.get("actionHistory").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+}
+
+fn inject_stage_state_into_output(mut output: Value, stage_state: &StageState) -> Value {
+    if let Some(object) = output.as_object_mut() {
+        object.insert(
+            "stageState".into(),
+            serde_json::to_value(stage_state).unwrap_or(Value::Null),
+        );
+    }
+    output
+}
+
+fn build_initial_stage_state(agent_type: &str, context_plan: &ContextPlan, handoff_summaries: &[Value]) -> StageState {
+    let stage = agent_type.to_string();
+    let goal = match agent_type {
+        "quick_read" => "Determine whether the paper is worth deeper reading based on high-signal evidence.",
+        "careful_read" => "Close the main method, result, and limitation gaps needed for a careful reading judgment.",
+        "deep_read" => "Validate novelty, core results, and caveats with targeted evidence collection.",
+        "summary" => "Produce a reliable final synthesis from the collected handoff chain and targeted evidence.",
+        _ => "Collect enough evidence to complete the current reading stage.",
+    }
+    .to_string();
+    let allowed_actions = allowed_actions_for_agent(agent_type);
+    let checks = build_stage_checks(agent_type, context_plan, handoff_summaries);
+
+    StageState {
+        stage,
+        goal,
+        allowed_actions,
+        checks,
+        visited_sources: Vec::new(),
+        open_questions: initial_open_questions(agent_type),
+        iteration: 0,
+        max_iterations: default_max_iterations(agent_type),
+        enough: false,
+    }
+}
+
+fn allowed_actions_for_agent(agent_type: &str) -> Vec<String> {
+    match agent_type {
+        "summary" => vec!["read_section", "search_text", "get_figure", "get_table", "finish", "blocked"],
+        _ => vec![
+            "read_section",
+            "search_text",
+            "get_figure",
+            "analyze_figure",
+            "get_table",
+            "finish",
+            "blocked",
+        ],
+    }
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn build_stage_checks(agent_type: &str, context_plan: &ContextPlan, handoff_summaries: &[Value]) -> Vec<StageCheckItem> {
+    let mut checks = match agent_type {
+        "quick_read" => vec![
+            stage_check("anchor_sections", "Anchor sections reviewed"),
+            stage_check("value_judgment", "Value judgment supported by evidence"),
+        ],
+        "careful_read" => vec![
+            stage_check("method_evidence", "Method evidence reviewed"),
+            stage_check("results_evidence", "Results evidence reviewed"),
+            stage_check("limitations", "Limitations or risks identified"),
+        ],
+        "deep_read" => vec![
+            stage_check("novelty", "Novelty claim checked"),
+            stage_check("core_results", "Core results verified"),
+            stage_check("caveats", "Main caveats identified"),
+        ],
+        "summary" => vec![
+            stage_check("handoff_chain", "Handoff chain is sufficient"),
+            stage_check("final_synthesis", "Final synthesis has enough support"),
+        ],
+        _ => vec![stage_check("evidence", "Sufficient evidence collected")],
+    };
+
+    if !context_plan.selected_figure_ids.is_empty() {
+        checks.push(stage_check("figures", "Relevant figures inspected"));
+    }
+    if !context_plan.selected_table_ids.is_empty() {
+        checks.push(stage_check("tables", "Relevant tables inspected"));
+    }
+    if !handoff_summaries.is_empty() {
+        for check in &mut checks {
+            if check.id == "handoff_chain" && handoff_chain_sufficient(agent_type, handoff_summaries) {
+                check.status = "done".to_string();
+                check.note = Some("Required upstream handoff summaries are available.".to_string());
+            }
+        }
+    }
+
+    checks
+}
+
+fn stage_check(id: &str, label: &str) -> StageCheckItem {
+    StageCheckItem {
+        id: id.to_string(),
+        label: label.to_string(),
+        status: "todo".to_string(),
+        required: true,
+        evidence_source_ids: Vec::new(),
+        note: None,
+    }
+}
+
+fn initial_open_questions(agent_type: &str) -> Vec<String> {
+    match agent_type {
+        "quick_read" => vec!["Which section best justifies the continue/skip decision?".to_string()],
+        "careful_read" => vec!["Which unresolved method or evaluation detail still matters most?".to_string()],
+        "deep_read" => vec!["Which novelty or validity claim still lacks direct support?".to_string()],
+        "summary" => vec!["Is the current synthesis fully supported by the handoff chain and evidence?".to_string()],
+        _ => Vec::new(),
+    }
+}
+
+fn default_max_iterations(agent_type: &str) -> i32 {
+    match agent_type {
+        "quick_read" => 3,
+        "careful_read" => 5,
+        "deep_read" => 6,
+        "summary" => 4,
+        _ => 4,
+    }
+}
+
+fn list_candidate_targets(
+    parsed_content: &ParsedPaperContent,
+    context_plan: &ContextPlan,
+    stage_state: &StageState,
+) -> Value {
+    let visited = &stage_state.visited_sources;
+    let sections = parsed_content
+        .sections
+        .iter()
+        .filter(|section| context_plan.selected_section_ids.iter().any(|id| id == &section.id))
+        .map(|section| {
+            json!({
+                "id": section.id,
+                "title": section.title,
+                "locator": section.locator,
+                "visited": visited.iter().any(|item| item == &format!("section:{}", section.id)),
+            })
+        })
+        .collect::<Vec<_>>();
+    let figures = parsed_content
+        .figures
+        .iter()
+        .filter(|figure| context_plan.selected_figure_ids.iter().any(|id| id == &figure.id))
+        .map(|figure| {
+            json!({
+                "id": figure.id,
+                "label": figure.label,
+                "locator": figure.locator,
+                "visited": visited.iter().any(|item| item == &format!("figure:{}", figure.id)),
+            })
+        })
+        .collect::<Vec<_>>();
+    let tables = parsed_content
+        .tables
+        .iter()
+        .filter(|table| context_plan.selected_table_ids.iter().any(|id| id == &table.id))
+        .map(|table| {
+            json!({
+                "id": table.id,
+                "label": table.label,
+                "locator": table.locator,
+                "visited": visited.iter().any(|item| item == &format!("table:{}", table.id)),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "sections": sections,
+        "figures": figures,
+        "tables": tables,
+    })
+}
+
+fn build_next_action_decision_prompt(
+    base_prompt: &str,
+    agent_type: &str,
+    stage_state: &StageState,
+    latest_output: Option<&Value>,
+    action_history: &[Value],
+    candidate_targets: &Value,
+) -> String {
     format!(
-        "{base_prompt}\n\nCurrent execution batch:\n- batchIndex: {batch_index}\n- sectionIds: {section_ids}\n- sectionTitles: {section_titles}\n- carryInSummaryIds: {carry_in_summary_ids}\n- promptBudgetEstimate: {prompt_budget_estimate}\n- Focus only on the evidence contained in this batch while keeping previous batch conclusions consistent.\n",
-        batch_index = batch.batch_index,
-        section_ids = serde_json::to_string(&batch.section_ids).unwrap_or_else(|_| "[]".into()),
-        section_titles = serde_json::to_string(&batch.section_titles).unwrap_or_else(|_| "[]".into()),
-        carry_in_summary_ids = serde_json::to_string(&batch.carry_in_summary_ids).unwrap_or_else(|_| "[]".into()),
-        prompt_budget_estimate = batch.prompt_budget_estimate,
+        "{base_prompt}\n\nDecision step for agent {agent_type}:\n- Return strict JSON only matching {{\"action\": string, \"target\": string|null, \"reason\": string, \"checkStatus\": [{{\"id\": string, \"status\": string}}], \"openQuestions\": string[]}}.\n- Choose exactly one action from the allowed actions in stageState.\n- Use action=finish only when the required checks are complete or enough=true.\n- Use action=blocked only when no productive next action exists.\n- Do not generate the final schema in this step.\n\nCurrent stageState:\n{stage_state}\n\nLatest output snapshot:\n{latest_output}\n\nAction history:\n{action_history}\n\nCandidate targets:\n{candidate_targets}",
+        stage_state = serde_json::to_string_pretty(stage_state).unwrap_or_else(|_| "{}".into()),
+        latest_output = latest_output.cloned().unwrap_or(Value::Null),
+        action_history = serde_json::to_string_pretty(action_history).unwrap_or_else(|_| "[]".into()),
+        candidate_targets = serde_json::to_string_pretty(candidate_targets).unwrap_or_else(|_| "{}".into()),
     )
 }
 
-fn merge_batch_output_json(agent_type: &str, batch_outputs: &[Value]) -> Result<Value, AppError> {
-    let Some(mut merged) = batch_outputs.first().cloned() else {
-        return Err(AppError::Internal("no batch outputs generated".into()));
-    };
-
-    for batch_output in batch_outputs.iter().skip(1) {
-        merge_json_values(&mut merged, batch_output);
-    }
-
-    if let Some(object) = merged.as_object_mut() {
-        object.insert("agentType".into(), Value::String(agent_type.to_string()));
-        object.insert("batchCount".into(), Value::Number(serde_json::Number::from(batch_outputs.len() as i64)));
-    }
-
-    Ok(merged)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolvedActionTarget {
+    action: String,
+    target: Option<String>,
+    batch_index: i32,
+    payload: Value,
 }
 
-fn merge_json_values(target: &mut Value, source: &Value) {
-    match (target, source) {
-        (Value::Object(target_map), Value::Object(source_map)) => {
-            for (key, source_value) in source_map {
-                match target_map.get_mut(key) {
-                    Some(target_value) => merge_json_values(target_value, source_value),
-                    None => {
-                        target_map.insert(key.clone(), source_value.clone());
+fn resolve_action_target(
+    decision: &DecisionEnvelope,
+    parsed_content: &ParsedPaperContent,
+    context_plan: &ContextPlan,
+) -> Result<ResolvedActionTarget, AppError> {
+    match decision.action.as_str() {
+        "read_section" | "search_text" => resolve_section_target(decision, parsed_content, context_plan),
+        "get_figure" | "analyze_figure" => resolve_figure_target(decision, parsed_content, context_plan),
+        "get_table" => resolve_table_target(decision, parsed_content, context_plan),
+        other => Err(AppError::Validation(format!("unsupported runtime action: {other}"))),
+    }
+}
+
+fn resolve_section_target(
+    decision: &DecisionEnvelope,
+    parsed_content: &ParsedPaperContent,
+    context_plan: &ContextPlan,
+) -> Result<ResolvedActionTarget, AppError> {
+    let requested_target = decision.target.clone().unwrap_or_default();
+    let normalized_target = requested_target.to_lowercase();
+    let candidates = parsed_content
+        .sections
+        .iter()
+        .filter(|section| context_plan.selected_section_ids.iter().any(|id| id == &section.id))
+        .collect::<Vec<_>>();
+
+    let section = if normalized_target.is_empty() {
+        candidates.first().copied()
+    } else if let Some(exact_match) = candidates.iter().copied().find(|section| {
+        section.id.eq_ignore_ascii_case(&requested_target)
+            || section.title.eq_ignore_ascii_case(&requested_target)
+            || section.locator.eq_ignore_ascii_case(&requested_target)
+    }) {
+        Some(exact_match)
+    } else if decision.action == "search_text" {
+        select_best_section_for_search(&candidates, &normalized_target)
+    } else {
+        candidates.iter().copied().find(|section| {
+            section.title.to_lowercase().contains(&normalized_target)
+                || section.locator.to_lowercase().contains(&normalized_target)
+        })
+    }
+        .ok_or_else(|| AppError::NotFound("no section target available for runtime action".into()))?;
+    let batch_index = context_plan
+        .batches
+        .iter()
+        .find(|batch| batch.section_ids.iter().any(|id| id == &section.id))
+        .map(|batch| batch.batch_index)
+        .unwrap_or(0);
+
+    Ok(ResolvedActionTarget {
+        action: decision.action.clone(),
+        target: Some(section.id.clone()),
+        batch_index,
+        payload: json!({
+            "section": {
+                "id": section.id,
+                "title": section.title,
+                "locator": section.locator,
+                "pageStart": section.start_page,
+                "pageEnd": section.end_page,
+                "text": truncate_text(&section.text, 4000),
+            }
+        }),
+    })
+}
+
+fn select_best_section_for_search<'a>(sections: &[&'a ParsedSection], normalized_target: &str) -> Option<&'a ParsedSection> {
+    let keywords = normalized_target
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| token.len() >= 2)
+        .collect::<Vec<_>>();
+
+    if keywords.is_empty() {
+        return None;
+    }
+
+    sections
+        .iter()
+        .copied()
+        .filter_map(|section| {
+            let title = section.title.to_lowercase();
+            let locator = section.locator.to_lowercase();
+            let text = section.text.to_lowercase();
+            let mut score = 0;
+
+            for keyword in &keywords {
+                if title.contains(keyword) {
+                    score += 5;
+                }
+                if locator.contains(keyword) {
+                    score += 4;
+                }
+                if text.contains(keyword) {
+                    score += 1;
+                }
+            }
+
+            if normalized_target.len() >= 3 && title.contains(normalized_target) {
+                score += 10;
+            }
+            if normalized_target.len() >= 3 && text.contains(normalized_target) {
+                score += 8;
+            }
+
+            (score > 0).then_some((score, section))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, section)| section)
+}
+
+fn resolve_figure_target(
+    decision: &DecisionEnvelope,
+    parsed_content: &ParsedPaperContent,
+    context_plan: &ContextPlan,
+) -> Result<ResolvedActionTarget, AppError> {
+    let target = decision.target.clone().unwrap_or_default().to_lowercase();
+    let figure = parsed_content
+        .figures
+        .iter()
+        .filter(|figure| context_plan.selected_figure_ids.iter().any(|id| id == &figure.id))
+        .find(|figure| {
+            target.is_empty()
+                || figure.id.eq_ignore_ascii_case(&target)
+                || figure.label.to_lowercase().contains(&target)
+                || figure.title.as_deref().unwrap_or_default().to_lowercase().contains(&target)
+        })
+        .or_else(|| {
+            parsed_content
+                .figures
+                .iter()
+                .find(|figure| context_plan.selected_figure_ids.iter().any(|id| id == &figure.id))
+        })
+        .ok_or_else(|| AppError::NotFound("no figure target available for runtime action".into()))?;
+    let batch_index = context_plan
+        .batches
+        .iter()
+        .find(|batch| batch.figure_ids.iter().any(|id| id == &figure.id))
+        .map(|batch| batch.batch_index)
+        .unwrap_or(0);
+
+    Ok(ResolvedActionTarget {
+        action: decision.action.clone(),
+        target: Some(figure.id.clone()),
+        batch_index,
+        payload: json!({
+            "figure": {
+                "id": figure.id,
+                "label": figure.label,
+                "title": figure.title,
+                "caption": figure.caption,
+                "locator": figure.locator,
+                "page": figure.page,
+                "summary": figure.summary,
+                "ocrText": figure.ocr_text,
+            }
+        }),
+    })
+}
+
+fn resolve_table_target(
+    decision: &DecisionEnvelope,
+    parsed_content: &ParsedPaperContent,
+    context_plan: &ContextPlan,
+) -> Result<ResolvedActionTarget, AppError> {
+    let target = decision.target.clone().unwrap_or_default().to_lowercase();
+    let table = parsed_content
+        .tables
+        .iter()
+        .filter(|table| context_plan.selected_table_ids.iter().any(|id| id == &table.id))
+        .find(|table| {
+            target.is_empty()
+                || table.id.eq_ignore_ascii_case(&target)
+                || table.label.to_lowercase().contains(&target)
+                || table.title.as_deref().unwrap_or_default().to_lowercase().contains(&target)
+        })
+        .or_else(|| {
+            parsed_content
+                .tables
+                .iter()
+                .find(|table| context_plan.selected_table_ids.iter().any(|id| id == &table.id))
+        })
+        .ok_or_else(|| AppError::NotFound("no table target available for runtime action".into()))?;
+    let batch_index = context_plan
+        .batches
+        .iter()
+        .find(|batch| batch.table_ids.iter().any(|id| id == &table.id))
+        .map(|batch| batch.batch_index)
+        .unwrap_or(0);
+
+    Ok(ResolvedActionTarget {
+        action: decision.action.clone(),
+        target: Some(table.id.clone()),
+        batch_index,
+        payload: json!({
+            "table": {
+                "id": table.id,
+                "label": table.label,
+                "title": table.title,
+                "caption": table.caption,
+                "locator": table.locator,
+                "page": table.page,
+                "summary": table.summary,
+                "markdownTable": table.markdown_table,
+                "ocrText": table.ocr_text,
+                "nearbyContext": table.nearby_context,
+                "cropStatus": table.crop_status,
+                "cropQuality": table.crop_quality,
+                "cropStrategy": table.crop_strategy,
+            }
+        }),
+    })
+}
+
+fn build_final_output_generation_prompt(
+    base_prompt: &str,
+    agent_type: &str,
+    stage_state: &StageState,
+    latest_output: Option<&Value>,
+    decision: &DecisionEnvelope,
+    resolved_action: &ResolvedActionTarget,
+    action_history: &[Value],
+) -> String {
+    format!(
+        "{base_prompt}\n\nAction execution and final-output generation step for agent {agent_type}:\n- You have already decided the next action.\n- Update the running output using the provided action payload and prior output.\n- Return strict JSON only matching the normal {agent_type} runtime schema.\n- Preserve previously established conclusions unless the new evidence changes them.\n\nCurrent stageState:\n{stage_state}\n\nDecision:\n{decision}\n\nResolved action payload:\n{payload}\n\nLatest output snapshot:\n{latest_output}\n\nAction history:\n{action_history}",
+        stage_state = serde_json::to_string_pretty(stage_state).unwrap_or_else(|_| "{}".into()),
+        decision = serde_json::to_string_pretty(decision).unwrap_or_else(|_| "{}".into()),
+        payload = serde_json::to_string_pretty(&resolved_action.payload).unwrap_or_else(|_| "{}".into()),
+        latest_output = latest_output.cloned().unwrap_or(Value::Null),
+        action_history = serde_json::to_string_pretty(action_history).unwrap_or_else(|_| "[]".into()),
+    )
+}
+
+fn build_finish_final_output_prompt(
+    base_prompt: &str,
+    agent_type: &str,
+    stage_state: &StageState,
+    latest_output: Option<&Value>,
+    action_history: &[Value],
+    decision: &DecisionEnvelope,
+) -> String {
+    format!(
+        "{base_prompt}\n\nFinish step for agent {agent_type}:\n- Do not read any new batch or new target.\n- Generate the final runtime schema directly from the existing evidence, latest output, action history, and stageState.\n- Return strict JSON only.\n- If the run is blocked, preserve uncertainty explicitly while still returning the required schema.\n\nCurrent stageState:\n{stage_state}\n\nFinish decision:\n{decision}\n\nLatest output snapshot:\n{latest_output}\n\nAction history:\n{action_history}",
+        stage_state = serde_json::to_string_pretty(stage_state).unwrap_or_else(|_| "{}".into()),
+        decision = serde_json::to_string_pretty(decision).unwrap_or_else(|_| "{}".into()),
+        latest_output = latest_output.cloned().unwrap_or(Value::Null),
+        action_history = serde_json::to_string_pretty(action_history).unwrap_or_else(|_| "[]".into()),
+    )
+}
+
+async fn request_decision_envelope(
+    model_config: &StoredModelConfig,
+    agent_type: &str,
+    prompt: &str,
+) -> Result<(DecisionEnvelope, CompletionEnvelope), AppError> {
+    let completion = request_model_completion(model_config, agent_type, prompt).await?;
+    let content = completion_content(&completion)?;
+    match parse_decision_envelope(&content) {
+        Ok(decision) => Ok((decision, completion)),
+        Err(AppError::SchemaInvalid(error_message)) => {
+            let repair_prompt = build_decision_repair_prompt(prompt, &content, &error_message);
+            let repair_completion = request_model_completion(model_config, agent_type, &repair_prompt).await?;
+            let repair_content = completion_content(&repair_completion)?;
+            let repaired = parse_decision_envelope(&repair_content)?;
+            Ok((repaired, merge_usage(completion, repair_completion)))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn request_runtime_decision(
+    model_config: &StoredModelConfig,
+    agent_type: &str,
+    base_prompt: &str,
+    stage_state: &StageState,
+    latest_output: Option<&Value>,
+    action_history: &[Value],
+    candidate_targets: &Value,
+) -> Result<(DecisionEnvelope, CompletionEnvelope), AppError> {
+    let decision_prompt = build_next_action_decision_prompt(
+        base_prompt,
+        agent_type,
+        stage_state,
+        latest_output,
+        action_history,
+        candidate_targets,
+    );
+    request_decision_envelope(model_config, agent_type, &decision_prompt).await
+}
+
+async fn resolve_runtime_action_with_retry(
+    model_config: &StoredModelConfig,
+    agent_type: &str,
+    base_prompt: &str,
+    parsed_content: &ParsedPaperContent,
+    context_plan: &ContextPlan,
+    stage_state: &StageState,
+    latest_output: Option<&Value>,
+    action_history: &[Value],
+    candidate_targets: &Value,
+    initial_decision: DecisionEnvelope,
+) -> Result<(DecisionEnvelope, ResolvedActionTarget, Option<CompletionEnvelope>), AppError> {
+    match resolve_action_target(&initial_decision, parsed_content, context_plan) {
+        Ok(resolved_action) => Ok((initial_decision, resolved_action, None)),
+        Err(AppError::NotFound(error_message)) | Err(AppError::Validation(error_message)) => {
+            let repair_prompt = build_target_resolution_repair_prompt(
+                base_prompt,
+                stage_state,
+                latest_output,
+                action_history,
+                candidate_targets,
+                &initial_decision,
+                &error_message,
+            );
+            let (repaired_decision, repair_completion) = request_decision_envelope(model_config, agent_type, &repair_prompt).await?;
+            let repaired_action = resolve_action_target(&repaired_decision, parsed_content, context_plan)?;
+            Ok((repaired_decision, repaired_action, Some(repair_completion)))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn request_final_output(
+    model_config: &StoredModelConfig,
+    agent_type: &str,
+    prompt: &str,
+) -> Result<(NormalizedAgentOutput, CompletionEnvelope), AppError> {
+    let completion = request_model_completion(model_config, agent_type, prompt).await?;
+    let content = completion_content(&completion)?;
+    match parse_agent_output(agent_type, &content) {
+        Ok(output) => Ok((output, completion)),
+        Err(AppError::SchemaInvalid(error_message)) => {
+            let repair_prompt = build_schema_repair_prompt(agent_type, prompt, &content, &error_message);
+            let repair_completion = request_model_completion(model_config, agent_type, &repair_prompt).await?;
+            let repair_content = completion_content(&repair_completion)?;
+            let repaired = parse_agent_output(agent_type, &repair_content)?;
+            Ok((repaired, merge_usage(completion, repair_completion)))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn parse_decision_envelope(content: &str) -> Result<DecisionEnvelope, AppError> {
+    let parsed: DecisionEnvelope = serde_json::from_str(content)
+        .map_err(|error| AppError::SchemaInvalid(format!("decision step returned invalid JSON: {error}")))?;
+    if parsed.action.trim().is_empty() {
+        return Err(AppError::SchemaInvalid("decision.action is required".into()));
+    }
+    if parsed.reason.trim().is_empty() {
+        return Err(AppError::SchemaInvalid("decision.reason is required".into()));
+    }
+    Ok(parsed)
+}
+
+fn build_decision_repair_prompt(original_prompt: &str, invalid_output: &str, validation_error: &str) -> String {
+    format!(
+        "The previous runtime decision response did not satisfy the decision schema. Repair it and return strict JSON only.\nRequired schema: {{\"action\": string, \"target\": string|null, \"reason\": string, \"checkStatus\": [{{\"id\": string, \"status\": string}}], \"openQuestions\": string[]}}\n\nOriginal prompt:\n{original_prompt}\n\nValidation error:\n{validation_error}\n\nInvalid output:\n{invalid_output}"
+    )
+}
+
+fn build_target_resolution_repair_prompt(
+    base_prompt: &str,
+    stage_state: &StageState,
+    latest_output: Option<&Value>,
+    action_history: &[Value],
+    candidate_targets: &Value,
+    invalid_decision: &DecisionEnvelope,
+    resolution_error: &str,
+) -> String {
+    format!(
+        "{base_prompt}\n\nThe previous decision used an invalid or unavailable target. Re-decide using ONLY the candidate targets below and return strict JSON only.\n- Keep the same decision schema.\n- If no valid target exists, choose action=blocked or action=finish instead of inventing a target.\n- Do not output any explanation outside JSON.\n\nResolution error:\n{resolution_error}\n\nPrevious invalid decision:\n{invalid_decision}\n\nCurrent stageState:\n{stage_state}\n\nLatest output snapshot:\n{latest_output}\n\nAction history:\n{action_history}\n\nCandidate targets:\n{candidate_targets}",
+        invalid_decision = serde_json::to_string_pretty(invalid_decision).unwrap_or_else(|_| "{}".into()),
+        stage_state = serde_json::to_string_pretty(stage_state).unwrap_or_else(|_| "{}".into()),
+        latest_output = latest_output.cloned().unwrap_or(Value::Null),
+        action_history = serde_json::to_string_pretty(action_history).unwrap_or_else(|_| "[]".into()),
+        candidate_targets = serde_json::to_string_pretty(candidate_targets).unwrap_or_else(|_| "{}".into()),
+    )
+}
+
+fn apply_decision_to_stage_state(
+    mut stage_state: StageState,
+    decision: &DecisionEnvelope,
+    resolved_action: Option<&ResolvedActionTarget>,
+    output_json: Option<&Value>,
+) -> StageState {
+    stage_state.iteration += 1;
+
+    for check_update in &decision.check_status {
+        if let Some(existing) = stage_state.checks.iter_mut().find(|item| item.id == check_update.id) {
+            existing.status = check_update.status.clone();
+            if let Some(resolved_action) = resolved_action {
+                if let Some(target) = resolved_action.target.as_ref() {
+                    let source_id = format!("{}:{}", action_source_kind(&resolved_action.action), target);
+                    if !existing.evidence_source_ids.iter().any(|item| item == &source_id) {
+                        existing.evidence_source_ids.push(source_id);
                     }
                 }
             }
         }
-        (Value::Array(target_items), Value::Array(source_items)) => {
-            for item in source_items {
-                if !target_items.iter().any(|existing| existing == item) {
-                    target_items.push(item.clone());
-                }
+    }
+
+    if let Some(resolved_action) = resolved_action {
+        if let Some(target) = resolved_action.target.as_ref() {
+            let source_id = format!("{}:{}", action_source_kind(&resolved_action.action), target);
+            if !stage_state.visited_sources.iter().any(|item| item == &source_id) {
+                stage_state.visited_sources.push(source_id);
             }
         }
-        (target_value, source_value) => {
-            let should_replace = matches!(target_value, Value::Null)
-                || target_value.as_str().map(|value| value.trim().is_empty()).unwrap_or(false);
-            if should_replace {
-                *target_value = source_value.clone();
-            }
+    }
+
+    stage_state.open_questions = decision.open_questions.clone();
+
+    if decision.action == "finish" {
+        stage_state.enough = true;
+    }
+
+    if let Some(output_json) = output_json {
+        let has_summary = output_json
+            .get("summary")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        if has_summary && stage_state.checks.iter().all(|check| !check.required || check.status == "done") {
+            stage_state.enough = true;
         }
+    }
+
+    stage_state
+}
+
+fn action_source_kind(action: &str) -> &'static str {
+    match action {
+        "read_section" | "search_text" => "section",
+        "get_figure" | "analyze_figure" => "figure",
+        "get_table" => "table",
+        _ => "source",
     }
 }
 
@@ -1976,6 +3194,7 @@ fn synthesize_agent_specific_fields(
     summary: &str,
 ) {
     match agent_type {
+        "quick_read" => synthesize_quick_read_fields(object, summary),
         "careful_read" => synthesize_careful_read_fields(object, summary),
         "deep_read" => synthesize_deep_read_fields(object, summary),
         "summary" => synthesize_summary_fields(object, summary),
@@ -2013,6 +3232,61 @@ fn derive_agent_summary(
             .map(str::to_string)
             .ok_or_else(|| AppError::SchemaInvalid("model output missing summary".into())),
     }
+}
+
+fn synthesize_quick_read_fields(object: &mut serde_json::Map<String, Value>, summary: &str) {
+    ensure_enum_field(
+        object,
+        "readingRecommendation",
+        &["worth_deep_read", "worth_skimming_or_save", "not_recommended"],
+        "worth_skimming_or_save",
+    );
+    ensure_enum_field(
+        object,
+        "priorityDecision",
+        &["值得精读", "值得略读/暂存", "不建议继续读"],
+        "值得略读/暂存",
+    );
+    ensure_enum_field(
+        object,
+        "recommendation",
+        &["continue", "skip", "uncertain"],
+        "uncertain",
+    );
+
+    let priority_reason_fallback = object
+        .get("summary")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(summary)
+        .trim()
+        .to_string();
+    let priority_reason_short = truncate_text(&priority_reason_fallback, 220);
+    ensure_non_empty_string_field(object, "priorityReason", &priority_reason_short);
+
+    let decision_reason_fallback = object
+        .get("priorityReason")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(priority_reason_fallback.as_str())
+        .trim()
+        .to_string();
+    ensure_non_empty_string_field(object, "decisionReason", &decision_reason_fallback);
+
+    let five_cs = object
+        .entry("fiveCs")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !five_cs.is_object() {
+        *five_cs = Value::Object(serde_json::Map::new());
+    }
+    let five_cs_object = five_cs
+        .as_object_mut()
+        .expect("fiveCs should be an object after normalization");
+    ensure_non_empty_string_field(five_cs_object, "category", "The paper appears to be a method-focused empirical research paper.");
+    ensure_non_empty_string_field(five_cs_object, "context", "Judge it by problem importance, method clarity, and whether visible evidence supports continued reading.");
+    ensure_non_empty_string_field(five_cs_object, "correctness", "Treat the current judgment as provisional until the main results, setup, and assumptions are checked more fully.");
+    ensure_non_empty_string_field(five_cs_object, "contributions", &priority_reason_short);
+    ensure_non_empty_string_field(five_cs_object, "clarity", "The value judgment should stay concise and explicitly tied to visible claims, method framing, and result signals.");
 }
 
 fn synthesize_careful_read_fields(object: &mut serde_json::Map<String, Value>, summary: &str) {
@@ -3029,18 +4303,184 @@ fn validate_enum(value: &str, allowed: &[&str], field: &str) -> Result<(), AppEr
 #[cfg(test)]
 mod tests {
     use super::{
-        build_context_plan, handoff_chain_sufficient, normalize_agent_output, resolve_handoff_summary_ids,
-        select_handoff_summaries, AppError, ParsedPaperContent, ParsedSection,
+        apply_decision_to_stage_state, build_context_plan, build_initial_stage_state,
+        extract_action_history_from_snapshot, extract_stage_state_from_snapshot, handoff_chain_sufficient,
+        normalize_agent_output, resolve_handoff_summary_ids, select_handoff_summaries,
+        update_action_history_in_snapshot, update_stage_state_in_snapshot, AppError, ContextBatch, ContextPlan,
+        DecisionEnvelope, ParsedPaperContent, ParsedSection, ResolvedActionTarget,
     };
     use crate::{
         models::parsed_content::ParsedMetadata,
-        models::runtime::{GetAgentRunRequest, RunAgentRequest},
-        services::parse_service::ParseService,
-        repositories::{database::Database, model_repository::ModelRepository, paper_repository::PaperRepository, runtime_repository::RuntimeRepository},
+        models::runtime::{DecisionCheckStatus, RunAgentRequest},
+    };
+    #[cfg(feature = "live-tauri-tests")]
+    use crate::{
+        models::runtime::GetAgentRunRequest,
+        repositories::{
+            database::Database,
+            model_repository::ModelRepository,
+            paper_repository::PaperRepository,
+            runtime_repository::RuntimeRepository,
+        },
     };
     use serde_json::json;
-    use std::{env, fs, path::PathBuf, sync::Arc, thread, time::Duration};
+    #[cfg(feature = "live-tauri-tests")]
+    use std::sync::Arc;
+    #[cfg(feature = "live-tauri-tests")]
+    use std::{env, path::PathBuf, thread, time::Duration};
+    #[cfg(feature = "live-tauri-tests")]
+    use std::fs;
+    #[cfg(feature = "live-tauri-tests")]
+    use crate::services::parse_service::ParseService;
+    #[cfg(feature = "live-tauri-tests")]
     use tauri::test::mock_app;
+
+    fn sample_context_plan() -> ContextPlan {
+        ContextPlan {
+            runtime_mode: "sectioned".into(),
+            section_strategy: "agent_default".into(),
+            selection_reason: "test selection".into(),
+            handoff_chain_complete: false,
+            backfill_reason: None,
+            gap_categories: vec!["method".into()],
+            selected_section_ids: vec!["sec-1".into(), "sec-2".into()],
+            selected_figure_ids: vec!["fig-1".into()],
+            selected_table_ids: vec!["tbl-1".into()],
+            used_handoff_summary_ids: vec!["hs-1".into()],
+            visual_mode: "disabled".into(),
+            batch_count: 2,
+            current_batch_index: 0,
+            truncated: false,
+            fallback_applied: false,
+            batches: vec![
+                ContextBatch {
+                    batch_index: 1,
+                    section_ids: vec!["sec-1".into()],
+                    section_titles: vec!["Intro".into()],
+                    figure_ids: vec![],
+                    table_ids: vec![],
+                    carry_in_summary_ids: vec![],
+                    prompt_budget_estimate: 1200,
+                },
+                ContextBatch {
+                    batch_index: 2,
+                    section_ids: vec!["sec-2".into()],
+                    section_titles: vec!["Results".into()],
+                    figure_ids: vec!["fig-1".into()],
+                    table_ids: vec!["tbl-1".into()],
+                    carry_in_summary_ids: vec!["hs-1".into()],
+                    prompt_budget_estimate: 1400,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn stage_state_snapshot_round_trip_preserves_loop_state() {
+        let context_plan = sample_context_plan();
+        let stage_state = build_initial_stage_state("careful_read", &context_plan, &[]);
+        let snapshot = json!({
+            "contextPlan": context_plan,
+            "stageState": null,
+            "actionHistory": [],
+        })
+        .to_string();
+
+        let updated_snapshot = update_stage_state_in_snapshot(&snapshot, &stage_state)
+            .expect("stage state should be written into snapshot");
+        let updated_snapshot = update_action_history_in_snapshot(
+            &updated_snapshot,
+            &[json!({"iteration": 1, "decision": {"action": "read_section"}, "resolvedAction": {"targetId": "sec-1"}})],
+        )
+        .expect("action history should be written into snapshot");
+
+        let extracted_stage_state = extract_stage_state_from_snapshot(&updated_snapshot)
+            .expect("stage state should round-trip from snapshot");
+        let extracted_action_history = extract_action_history_from_snapshot(&updated_snapshot);
+
+        assert_eq!(extracted_stage_state.stage, "careful_read");
+        assert_eq!(extracted_stage_state.allowed_actions.first().map(String::as_str), Some("read_section"));
+        assert_eq!(extracted_action_history.len(), 1);
+        assert_eq!(extracted_action_history[0].get("iteration").and_then(|value| value.as_i64()), Some(1));
+    }
+
+    #[test]
+    fn initial_stage_state_uses_todo_checks_and_agent_specific_limits() {
+        let context_plan = sample_context_plan();
+        let handoff_summaries = vec![json!({
+            "id": "hs-1",
+            "stage": "quick_read",
+            "compressedConclusion": "ready",
+            "keyPoints": ["kp"],
+            "carryForwardQuestions": [],
+            "carryForwardEvidence": [],
+            "nextStepSuggestion": "continue",
+            "generatedAt": "2026-04-03T13:02:00Z"
+        })];
+
+        let stage_state = build_initial_stage_state("summary", &context_plan, &handoff_summaries);
+
+        assert_eq!(stage_state.stage, "summary");
+        assert_eq!(stage_state.max_iterations, 4);
+        assert!(stage_state.allowed_actions.iter().any(|action| action == "finish"));
+        assert!(stage_state.allowed_actions.iter().all(|action| action != "analyze_figure"));
+        assert!(stage_state.checks.iter().all(|check| check.status == "todo"));
+        assert!(stage_state.checks.iter().any(|check| check.id == "handoff_chain"));
+        assert!(stage_state.checks.iter().any(|check| check.id == "figures"));
+        assert!(stage_state.checks.iter().any(|check| check.id == "tables"));
+    }
+
+    #[test]
+    fn apply_decision_updates_checks_sources_questions_and_enough() {
+        let context_plan = sample_context_plan();
+        let mut stage_state = build_initial_stage_state("quick_read", &context_plan, &[]);
+        stage_state.checks.iter_mut().for_each(|check| {
+            if check.id == "value_judgment" {
+                check.status = "todo".into();
+            }
+        });
+
+        let decision = DecisionEnvelope {
+            action: "finish".into(),
+            target: Some("sec-1".into()),
+            reason: "Enough evidence collected".into(),
+            check_status: vec![
+                DecisionCheckStatus {
+                    id: "anchor_sections".into(),
+                    status: "done".into(),
+                },
+                DecisionCheckStatus {
+                    id: "value_judgment".into(),
+                    status: "done".into(),
+                },
+            ],
+            open_questions: vec!["none remaining".into()],
+        };
+        let resolved_action = ResolvedActionTarget {
+            action: "read_section".into(),
+            target: Some("sec-1".into()),
+            batch_index: 1,
+            payload: json!({"section": {"id": "sec-1"}}),
+        };
+
+        let next_state = apply_decision_to_stage_state(
+            stage_state,
+            &decision,
+            Some(&resolved_action),
+            Some(&json!({"summary": "Sufficient support gathered."})),
+        );
+
+        assert_eq!(next_state.iteration, 1);
+        assert!(next_state.enough);
+        assert_eq!(next_state.open_questions, vec!["none remaining".to_string()]);
+        assert!(next_state.visited_sources.iter().any(|item| item == "section:sec-1"));
+        assert!(next_state
+            .checks
+            .iter()
+            .any(|check| check.id == "anchor_sections" && check.evidence_source_ids.iter().any(|item| item == "section:sec-1")));
+        assert!(next_state.checks.iter().any(|check| check.id == "anchor_sections" && check.status == "done"));
+        assert!(next_state.checks.iter().any(|check| check.id == "value_judgment" && check.status == "done"));
+    }
 
     #[test]
     fn quick_read_output_synthesizes_missing_handoff_summary() {
@@ -3076,6 +4516,42 @@ mod tests {
             .get("carryForwardEvidence")
             .and_then(|value| value.as_array())
             .is_some_and(|items| !items.is_empty()));
+    }
+
+    #[test]
+    fn quick_read_output_synthesizes_missing_decision_reason_and_five_cs() {
+        let parsed = json!({
+            "summary": "The paper is promising because it has a clear problem framing and visible result signal.",
+            "evidence": [
+                {
+                    "quote": "Our method outperforms the prior baseline on the benchmark.",
+                    "section": "Results",
+                    "page": 8,
+                    "locator": "Section 4.3"
+                }
+            ],
+            "readingRecommendation": "worth_deep_read",
+            "priorityDecision": "值得精读",
+            "recommendation": "continue",
+            "priorityReason": "The visible result signal is strong enough to justify a deeper read."
+        });
+
+        let normalized = normalize_agent_output("quick_read", parsed).expect("normalization should succeed");
+        let object = normalized.output_json.as_object().expect("normalized output should remain an object");
+        let five_cs = object
+            .get("fiveCs")
+            .and_then(|value| value.as_object())
+            .expect("fiveCs should be synthesized");
+
+        assert_eq!(
+            object.get("decisionReason").and_then(|value| value.as_str()),
+            Some("The visible result signal is strong enough to justify a deeper read.")
+        );
+        assert!(five_cs.get("category").and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty()));
+        assert!(five_cs.get("context").and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty()));
+        assert!(five_cs.get("correctness").and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty()));
+        assert!(five_cs.get("contributions").and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty()));
+        assert!(five_cs.get("clarity").and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty()));
     }
 
     #[test]
@@ -3231,6 +4707,9 @@ mod tests {
             max_sections_per_batch: None,
             max_batches: None,
             pinned_section_ids: None,
+            visual_mode: None,
+            pinned_figure_ids: None,
+            pinned_table_ids: None,
         };
 
         let handoff_summaries = vec![
@@ -3259,6 +4738,9 @@ mod tests {
             max_sections_per_batch: None,
             max_batches: None,
             pinned_section_ids: None,
+            visual_mode: None,
+            pinned_figure_ids: None,
+            pinned_table_ids: None,
         };
         let parsed_content = ParsedPaperContent {
             paper_id: "paper-1".into(),
@@ -3287,10 +4769,14 @@ mod tests {
                 },
             ],
             references: Vec::new(),
+            figures: Vec::new(),
+            tables: Vec::new(),
+            visual_evidence: Vec::new(),
             metadata: ParsedMetadata {
                 page_count: Some(8),
                 parser: "test".into(),
                 parsed_at: "2026-04-04T00:00:00Z".into(),
+                visual_parsing: None,
             },
         };
         let handoff_summaries = vec![
@@ -3303,9 +4789,9 @@ mod tests {
         assert!(handoff_chain_sufficient("summary", &selected));
 
         let context_plan = build_context_plan(&request, &parsed_content, &handoff_summaries);
-        assert!(context_plan.selected_section_ids.is_empty());
         assert_eq!(context_plan.used_handoff_summary_ids.len(), 3);
-        assert_eq!(context_plan.batch_count, 0);
+        assert!(!context_plan.selected_section_ids.is_empty());
+        assert!(context_plan.batch_count >= 1);
     }
 
     #[test]
@@ -3322,6 +4808,9 @@ mod tests {
             max_sections_per_batch: Some(3),
             max_batches: Some(2),
             pinned_section_ids: None,
+            visual_mode: None,
+            pinned_figure_ids: None,
+            pinned_table_ids: None,
         };
         let parsed_content = ParsedPaperContent {
             paper_id: "paper-1".into(),
@@ -3360,10 +4849,14 @@ mod tests {
                 },
             ],
             references: Vec::new(),
+            figures: Vec::new(),
+            tables: Vec::new(),
+            visual_evidence: Vec::new(),
             metadata: ParsedMetadata {
                 page_count: Some(8),
                 parser: "test".into(),
                 parsed_at: "2026-04-04T00:00:00Z".into(),
+                visual_parsing: None,
             },
         };
         let handoff_summaries = vec![
@@ -3403,6 +4896,9 @@ mod tests {
             max_sections_per_batch: Some(3),
             max_batches: Some(2),
             pinned_section_ids: None,
+            visual_mode: None,
+            pinned_figure_ids: None,
+            pinned_table_ids: None,
         };
         let parsed_content = ParsedPaperContent {
             paper_id: "paper-1".into(),
@@ -3451,10 +4947,14 @@ mod tests {
                 },
             ],
             references: Vec::new(),
+            figures: Vec::new(),
+            tables: Vec::new(),
+            visual_evidence: Vec::new(),
             metadata: ParsedMetadata {
                 page_count: Some(8),
                 parser: "test".into(),
                 parsed_at: "2026-04-04T00:00:00Z".into(),
+                visual_parsing: None,
             },
         };
         let handoff_summaries = vec![
@@ -3477,6 +4977,7 @@ mod tests {
         assert!(context_plan.selected_section_ids.iter().any(|id| id == "sec-limits"));
     }
 
+    #[cfg(feature = "live-tauri-tests")]
     #[tokio::test]
     async fn live_quick_read_updates_batch_progress_and_persists_merged_output() {
         let appdata = env::var("APPDATA").expect("APPDATA should be available on Windows");
@@ -3539,6 +5040,9 @@ mod tests {
                         max_sections_per_batch: Some(1),
                         max_batches: Some(2),
                         pinned_section_ids: None,
+                        visual_mode: None,
+                        pinned_figure_ids: None,
+                        pinned_table_ids: None,
                     };
 
                     runtime_repository.create_run(request, &client, &model_config).await
@@ -3593,7 +5097,10 @@ mod tests {
                     return;
                 }
                 Err(AppError::UpstreamUnavailable(message))
-                    if message.contains("system_cpu_overloaded") && attempt < 3 =>
+                    if (message.contains("system_cpu_overloaded")
+                        || message.contains("missing close_notify")
+                        || message.contains("curl runtime request failed with exit code Some(56)"))
+                        && attempt < 3 =>
                 {
                     last_overload_error = Some(message);
                     thread::sleep(Duration::from_secs(2));
@@ -3608,6 +5115,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "live-tauri-tests")]
     #[tokio::test]
     async fn live_reparse_updates_real_paper_sections_in_persisted_artifact() {
         let appdata = env::var("APPDATA").expect("APPDATA should be available on Windows");

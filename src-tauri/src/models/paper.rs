@@ -1,6 +1,6 @@
 use crate::models::{
     parsed_content::{ParsedFigure, ParsedTable, ParsedVisualEvidence, VisualDiagnostic},
-    runtime::{AgentRunSummary, ContextPlan},
+    runtime::{AgentRunSummary, ContextPlan, StageState},
 };
 
 use serde::{Deserialize, Serialize};
@@ -102,7 +102,19 @@ pub struct PaperParseStatusResponse {
     pub stage: String,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    pub visual_parsing: Option<VisualParsingSummary>,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VisualParsingSummary {
+    pub enabled: bool,
+    pub figure_count: i32,
+    pub table_count: i32,
+    pub crop_success_count: i32,
+    pub crop_failed_count: i32,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,6 +169,8 @@ pub struct ParsedContentSummary {
     pub visual_enabled: bool,
     pub visual_mode: String,
     pub visual_summary_count: i32,
+    pub crop_success_count: i32,
+    pub crop_failed_count: i32,
     pub sample_caption: Option<String>,
     pub sample_summary: Option<String>,
     pub visual_warnings: Vec<String>,
@@ -191,4 +205,6 @@ pub struct ActiveAgentRunResponse {
     pub current_batch_index: i32,
     pub current_batch_count: i32,
     pub context_plan: ContextPlan,
+    pub stage_state: Option<StageState>,
+    pub action_history: Vec<serde_json::Value>,
 }

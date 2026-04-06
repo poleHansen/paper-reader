@@ -134,6 +134,16 @@ impl Database {
             }
 
             let parsed_visual_artifact_columns = table_columns(connection, "parsed_visual_artifacts")?;
+            if !parsed_visual_artifact_columns.iter().any(|column| column == "crop_success_count") {
+                connection.execute_batch(
+                    "ALTER TABLE parsed_visual_artifacts ADD COLUMN crop_success_count INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            if !parsed_visual_artifact_columns.iter().any(|column| column == "crop_failed_count") {
+                connection.execute_batch(
+                    "ALTER TABLE parsed_visual_artifacts ADD COLUMN crop_failed_count INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
             if !parsed_visual_artifact_columns.iter().any(|column| column == "sample_caption") {
                 connection.execute_batch(
                     "ALTER TABLE parsed_visual_artifacts ADD COLUMN sample_caption TEXT;",

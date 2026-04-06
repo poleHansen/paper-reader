@@ -15,9 +15,9 @@ use crate::{
         paper::{
             ConfirmPaperMetadataRequest, ConfirmPaperMetadataResponse, ImportPaperFromFileResponse,
             PaperParseStatusResponse, PaperVisualArtifactsResponse, ParsedContentSummary,
-            ReaderSnapshotResponse,
+            ReaderSnapshotResponse, VisualParsingSummary,
         },
-        parsed_content::ParsedPaperContent,
+        parsed_content::{ParsedPaperContent, VisualDiagnostic},
     },
     repositories::{database::Database, runtime_repository::RuntimeRepository},
     utils::time::now_iso,
@@ -282,14 +282,25 @@ impl PaperRepository {
                             t.stage,
                             COALESCE(t.last_error_code, uf.parse_error_code),
                             COALESCE(t.last_error_message, uf.parse_error_message),
+                            COALESCE(pva.figure_count, 0),
+                            COALESCE(pva.table_count, 0),
+                            COALESCE(pva.crop_success_count, 0),
+                            COALESCE(pva.crop_failed_count, 0),
+                            COALESCE(pva.warnings_json, '[]'),
                             t.updated_at
                      FROM paper_parse_tasks t
                      LEFT JOIN uploaded_files uf ON uf.paper_id = t.paper_id
+                     LEFT JOIN parsed_visual_artifacts pva ON pva.paper_id = t.paper_id
                      WHERE t.paper_id = ?1
                      ORDER BY uf.created_at DESC
                      LIMIT 1",
                     rusqlite::params![paper_id],
                     |row| {
+                        let warnings_json: String = row.get(10)?;
+                        let figure_count = row.get::<_, Option<i32>>(6).unwrap_or(Some(0)).unwrap_or(0);
+                        let table_count = row.get::<_, Option<i32>>(7).unwrap_or(Some(0)).unwrap_or(0);
+                        let crop_success_count = row.get::<_, Option<i32>>(8).unwrap_or(Some(0)).unwrap_or(0);
+                        let crop_failed_count = row.get::<_, Option<i32>>(9).unwrap_or(Some(0)).unwrap_or(0);
                         Ok(PaperParseStatusResponse {
                             paper_id: row.get(0)?,
                             parse_status: row.get(1)?,
@@ -297,7 +308,16 @@ impl PaperRepository {
                             stage: row.get(3)?,
                             error_code: row.get(4)?,
                             error_message: row.get(5)?,
-                            updated_at: row.get(6)?,
+                            visual_parsing: Some(VisualParsingSummary {
+                                enabled: figure_count > 0 || table_count > 0,
+                                figure_count,
+                                table_count,
+                                crop_success_count,
+                                crop_failed_count,
+                                warnings: serde_json::from_str::<Vec<String>>(&warnings_json)
+                                    .unwrap_or_default(),
+                            }),
+                            updated_at: row.get(11)?,
                         })
                     },
                 )
@@ -341,10 +361,12 @@ impl PaperRepository {
                                 COALESCE(ppa.visual_enabled, 0),
                                 COALESCE(ppa.visual_mode, 'disabled'),
                                 COALESCE(ppa.visual_summary_count, 0),
+                                COALESCE(pva.crop_success_count, 0),
+                                COALESCE(pva.crop_failed_count, 0),
                                 pva.sample_caption,
                                 pva.sample_summary,
-                                pva.warnings_json,
-                                pva.diagnostics_json,
+                                COALESCE(pva.warnings_json, '[]'),
+                                COALESCE(pva.diagnostics_json, '[]'),
                         p.updated_at
                      FROM papers p
                      LEFT JOIN uploaded_files uf ON uf.paper_id = p.id
@@ -359,8 +381,8 @@ impl PaperRepository {
                     |row| {
                         let authors_json: String = row.get(3)?;
                         let tags_json: Option<String> = row.get(18)?;
-                        let warnings_json: Option<String> = row.get(31)?;
-                        let diagnostics_json: Option<String> = row.get(32)?;
+                        let warnings_json: String = row.get(33)?;
+                        let diagnostics_json: String = row.get(34)?;
                         let parsed_content = if let Some(version) = row.get::<_, Option<i32>>(20)? {
                             let storage_path = row.get::<_, String>(21).unwrap_or_default();
                             Some(ParsedContentSummary {
@@ -373,17 +395,15 @@ impl PaperRepository {
                                 visual_enabled: row.get::<_, Option<bool>>(26).unwrap_or(Some(false)).unwrap_or(false),
                                 visual_mode: row.get::<_, Option<String>>(27).unwrap_or(Some("disabled".into())).unwrap_or_else(|| "disabled".into()),
                                 visual_summary_count: row.get::<_, Option<i32>>(28).unwrap_or(Some(0)).unwrap_or(0),
-                                sample_caption: row.get(29)?,
-                                sample_summary: row.get(30)?,
-                                visual_warnings: warnings_json
-                                    .as_deref()
-                                    .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+                                crop_success_count: row.get::<_, Option<i32>>(29).unwrap_or(Some(0)).unwrap_or(0),
+                                crop_failed_count: row.get::<_, Option<i32>>(30).unwrap_or(Some(0)).unwrap_or(0),
+                                sample_caption: row.get(31)?,
+                                sample_summary: row.get(32)?,
+                                visual_warnings: serde_json::from_str::<Vec<String>>(&warnings_json)
                                     .unwrap_or_default(),
                                 github_upload_diagnostics: load_github_upload_diagnostics(&storage_path),
-                                visual_diagnostics: diagnostics_json
-                                    .as_deref()
-                                    .and_then(|value| serde_json::from_str::<Vec<crate::models::parsed_content::VisualDiagnostic>>(value).ok())
-                                    .unwrap_or_else(|| load_visual_diagnostics(&storage_path)),
+                                visual_diagnostics: serde_json::from_str::<Vec<VisualDiagnostic>>(&diagnostics_json)
+                                    .unwrap_or_else(|_| load_visual_diagnostics(&storage_path)),
                             })
                         } else {
                             None

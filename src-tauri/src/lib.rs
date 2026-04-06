@@ -35,6 +35,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::agent_commands::run_agent,
+            commands::agent_commands::analyze_visuals,
             commands::agent_commands::get_agent_run,
             commands::profile_commands::get_profile,
             commands::profile_commands::upsert_profile,

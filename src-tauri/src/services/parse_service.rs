@@ -232,7 +232,7 @@ impl ParseService {
         let mut pending_evidence = Vec::new();
 
         for figure in &mut parsed.figures {
-            if figure.image_path.trim().is_empty() {
+            let Some(image_path) = figure.image_path.clone().filter(|value| !value.trim().is_empty()) else {
                 warnings.push(format!(
                     "{} multimodal skipped: no exported image asset is available for {}",
                     figure.id, figure.label
@@ -244,7 +244,7 @@ impl ParseService {
                     retryable: true,
                 });
                 continue;
-            }
+            };
 
             match interpret_visual_artifact_with_timeout(
                 model_config.clone(),
@@ -252,7 +252,7 @@ impl ParseService {
                 "figure".to_string(),
                 figure.label.clone(),
                 figure.caption.clone(),
-                figure.image_path.clone(),
+                image_path,
                 paper_title.map(str::to_string),
             ).await {
                 Ok(outcome) => {
@@ -282,7 +282,7 @@ impl ParseService {
         }
 
         for table in &mut parsed.tables {
-            if table.image_path.trim().is_empty() {
+            let Some(image_path) = table.image_path.clone().filter(|value| !value.trim().is_empty()) else {
                 warnings.push(format!(
                     "{} multimodal skipped: no exported image asset is available for {}",
                     table.id, table.label
@@ -294,7 +294,7 @@ impl ParseService {
                     retryable: true,
                 });
                 continue;
-            }
+            };
 
             match interpret_visual_artifact_with_timeout(
                 model_config.clone(),
@@ -302,7 +302,7 @@ impl ParseService {
                 "table".to_string(),
                 table.label.clone(),
                 table.caption.clone(),
-                table.image_path.clone(),
+                image_path,
                 paper_title.map(str::to_string),
             ).await {
                 Ok(outcome) => {
@@ -351,10 +351,30 @@ impl ParseService {
             .get_or_insert_with(default_visual_parsing_metadata);
         visual_metadata.figure_count = parsed.figures.len() as i32;
         visual_metadata.table_count = parsed.tables.len() as i32;
-        visual_metadata.asset_count = visual_metadata.figure_count + visual_metadata.table_count;
-        visual_metadata.enabled = visual_metadata.asset_count > 0;
+        visual_metadata.crop_success_count = parsed
+            .figures
+            .iter()
+            .filter(|figure| figure.crop_status.as_deref() == Some("success"))
+            .count() as i32
+            + parsed
+                .tables
+                .iter()
+                .filter(|table| table.crop_status.as_deref() == Some("success"))
+                .count() as i32;
+        visual_metadata.crop_failed_count = parsed
+            .figures
+            .iter()
+            .filter(|figure| figure.crop_status.as_deref() == Some("failed"))
+            .count() as i32
+            + parsed
+                .tables
+                .iter()
+                .filter(|table| table.crop_status.as_deref() == Some("failed"))
+                .count() as i32;
+        visual_metadata.asset_count = visual_metadata.crop_success_count;
+        visual_metadata.enabled = visual_metadata.figure_count + visual_metadata.table_count > 0;
         visual_metadata.multimodal_summary_count = multimodal_count;
-        visual_metadata.mode = if multimodal_count > 0 { "multimodal".into() } else { "caption_index".into() };
+        visual_metadata.mode = if multimodal_count > 0 { "multimodal".into() } else { visual_metadata.mode.clone() };
         visual_metadata.github_upload_diagnostics = github_upload_diagnostics;
         visual_metadata.diagnostics = diagnostics;
         visual_metadata.warnings = warnings;
@@ -434,9 +454,9 @@ impl ParseService {
                 ],
             )?;
             connection.execute(
-                "INSERT INTO parsed_visual_artifacts (paper_id, version, asset_dir, figure_count, table_count, visual_mode, multimodal_interpreted, sample_caption, sample_summary, warnings_json, diagnostics_json, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                 ON CONFLICT(paper_id) DO UPDATE SET version = excluded.version, asset_dir = excluded.asset_dir, figure_count = excluded.figure_count, table_count = excluded.table_count, visual_mode = excluded.visual_mode, multimodal_interpreted = excluded.multimodal_interpreted, sample_caption = excluded.sample_caption, sample_summary = excluded.sample_summary, warnings_json = excluded.warnings_json, diagnostics_json = excluded.diagnostics_json, updated_at = excluded.updated_at",
+                "INSERT INTO parsed_visual_artifacts (paper_id, version, asset_dir, figure_count, table_count, visual_mode, multimodal_interpreted, crop_success_count, crop_failed_count, sample_caption, sample_summary, warnings_json, diagnostics_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT(paper_id) DO UPDATE SET version = excluded.version, asset_dir = excluded.asset_dir, figure_count = excluded.figure_count, table_count = excluded.table_count, visual_mode = excluded.visual_mode, multimodal_interpreted = excluded.multimodal_interpreted, crop_success_count = excluded.crop_success_count, crop_failed_count = excluded.crop_failed_count, sample_caption = excluded.sample_caption, sample_summary = excluded.sample_summary, warnings_json = excluded.warnings_json, diagnostics_json = excluded.diagnostics_json, updated_at = excluded.updated_at",
                 rusqlite::params![
                     paper_id,
                     parsed.version,
@@ -445,6 +465,8 @@ impl ParseService {
                     table_count,
                     visual_metadata.mode,
                     multimodal_interpreted,
+                    visual_metadata.crop_success_count,
+                    visual_metadata.crop_failed_count,
                     sample_caption,
                     sample_summary,
                     warnings_json,
@@ -587,6 +609,8 @@ fn default_visual_parsing_metadata() -> VisualParsingMetadata {
         asset_count: 0,
         figure_count: 0,
         table_count: 0,
+        crop_success_count: 0,
+        crop_failed_count: 0,
         multimodal_summary_count: 0,
         github_upload_diagnostics: Vec::new(),
         diagnostics: Vec::new(),
@@ -612,9 +636,29 @@ fn apply_visual_fallback_metadata(parsed: &mut ParsedPaperContent, mode: &str, w
         .get_or_insert_with(default_visual_parsing_metadata);
     visual_metadata.enabled = !parsed.figures.is_empty() || !parsed.tables.is_empty();
     visual_metadata.mode = mode.to_string();
-    visual_metadata.asset_count = (parsed.figures.len() + parsed.tables.len()) as i32;
     visual_metadata.figure_count = parsed.figures.len() as i32;
     visual_metadata.table_count = parsed.tables.len() as i32;
+    visual_metadata.crop_success_count = parsed
+        .figures
+        .iter()
+        .filter(|figure| figure.crop_status.as_deref() == Some("success"))
+        .count() as i32
+        + parsed
+            .tables
+            .iter()
+            .filter(|table| table.crop_status.as_deref() == Some("success"))
+            .count() as i32;
+    visual_metadata.crop_failed_count = parsed
+        .figures
+        .iter()
+        .filter(|figure| figure.crop_status.as_deref() == Some("failed"))
+        .count() as i32
+        + parsed
+            .tables
+            .iter()
+            .filter(|table| table.crop_status.as_deref() == Some("failed"))
+            .count() as i32;
+    visual_metadata.asset_count = visual_metadata.crop_success_count;
     visual_metadata.multimodal_summary_count = 0;
     if !warning.trim().is_empty() {
         visual_metadata.diagnostics.push(VisualDiagnostic {
@@ -724,6 +768,7 @@ fn interpret_visual_artifact(
     caption: &str,
     image_path: &str,
     remote_image_url: Option<&str>,
+    user_question: Option<&str>,
 ) -> Result<String, String> {
     let image_bytes = fs::read(image_path).map_err(|error| format!("failed to read image asset: {error}"))?;
     if image_bytes.is_empty() {
@@ -760,6 +805,7 @@ fn interpret_visual_artifact(
         &image_input,
         &resolved_api_type,
         model_config.image_input_format.as_deref(),
+        user_question,
     );
     let mut variant_failures = Vec::new();
 
@@ -840,10 +886,16 @@ fn build_multimodal_request_payload_variants(
     image_input: &str,
     api_type: &str,
     preferred_format: Option<&str>,
+    user_question: Option<&str>,
 ) -> Vec<crate::repositories::runtime_repository::MultimodalPayloadVariant> {
+    let task_tail = user_question
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" Focus on this reader question: {value}"))
+        .unwrap_or_default();
     let prompt = format!(
-        "You are analyzing a scientific {}. Return plain text only. Summarize the key visual finding in 1-2 sentences. Mention trends, comparisons, or notable structure visible in the image. Label: {}. Caption: {}",
-        artifact_type, label, caption
+        "You are analyzing a scientific {}. Return plain text only. Summarize the key visual finding in 2-4 sentences. Mention trends, comparisons, structure, axes, legends, or anomalies visible in the image. If the object is a table, explain the most decision-relevant rows, columns, and comparisons. Label: {}. Caption: {}.{}",
+        artifact_type, label, caption, task_tail
     );
 
     let image_reference = image_input.trim();
@@ -1079,14 +1131,13 @@ async fn prepare_visual_input(
     }
 }
 
-#[derive(Debug, Clone)]
-struct VisualInterpretationOutcome {
-    summary: String,
-    upload_warning: Option<String>,
-    upload_diagnostic: Option<VisualDiagnostic>,
+pub struct VisualInterpretationOutcome {
+    pub summary: String,
+    pub upload_warning: Option<String>,
+    pub upload_diagnostic: Option<VisualDiagnostic>,
 }
 
-async fn interpret_visual_artifact_with_timeout(
+pub async fn analyze_visual_artifact_on_demand(
     model_config: StoredModelConfig,
     github_asset_service: Arc<GitHubAssetService>,
     artifact_type: String,
@@ -1094,6 +1145,7 @@ async fn interpret_visual_artifact_with_timeout(
     caption: String,
     image_path: String,
     paper_title: Option<String>,
+    user_question: Option<String>,
 ) -> Result<VisualInterpretationOutcome, String> {
     if model_config.image_input_format.as_deref() == Some("upstream_vision_unavailable") {
         return Err("multimodal image requests are disabled for this model config because the upstream vision route consistently failed during probing".into());
@@ -1124,6 +1176,7 @@ async fn interpret_visual_artifact_with_timeout(
             &caption,
             &prepared.resolved_image_path,
             prepared.remote_image_url.as_deref(),
+            user_question.as_deref(),
         )
     });
 
@@ -1138,6 +1191,27 @@ async fn interpret_visual_artifact_with_timeout(
         upload_warning,
         upload_diagnostic,
     })
+}
+
+async fn interpret_visual_artifact_with_timeout(
+    model_config: StoredModelConfig,
+    github_asset_service: Arc<GitHubAssetService>,
+    artifact_type: String,
+    label: String,
+    caption: String,
+    image_path: String,
+    paper_title: Option<String>,
+) -> Result<VisualInterpretationOutcome, String> {
+    analyze_visual_artifact_on_demand(
+        model_config,
+        github_asset_service,
+        artifact_type,
+        label,
+        caption,
+        image_path,
+        paper_title,
+        None,
+    ).await
 }
 
 fn resolve_visual_asset_path(image_path: &str) -> Option<String> {

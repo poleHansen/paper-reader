@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import {
   confirmPaperMetadataResponseSchema,
   agentRunDetailSchema,
+  analyzeVisualsResponseSchema,
   githubUploadTestResponseSchema,
   importPaperFromFileResponseSchema,
   libraryItemMutationResponseSchema,
@@ -19,6 +20,8 @@ import {
 } from '../schemas/contracts';
 import type {
   AgentRunDetail,
+  AnalyzeVisualsRequest,
+  AnalyzeVisualsResponse,
   ConfirmPaperMetadataRequest,
   ConfirmPaperMetadataResponse,
   GetAgentRunRequest,
@@ -179,6 +182,11 @@ export async function getPaperVisualArtifacts(
 ): Promise<PaperVisualArtifactsResponse> {
   const response = await invoke('get_paper_visual_artifacts', { request: payload });
   return paperVisualArtifactsResponseSchema.parse(response);
+}
+
+export async function analyzeVisuals(payload: AnalyzeVisualsRequest): Promise<AnalyzeVisualsResponse> {
+  const response = await invoke('analyze_visuals', { request: payload });
+  return analyzeVisualsResponseSchema.parse(response);
 }
 
 export async function runAgent(payload: RunAgentRequest): Promise<RunAgentResponse> {

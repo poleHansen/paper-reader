@@ -1,5 +1,33 @@
 import { z } from 'zod';
 
+const stageCheckItemSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  status: z.string(),
+  required: z.boolean().default(true),
+  evidenceSourceIds: z.array(z.string()).default([]),
+  note: z.string().nullable(),
+});
+
+const stageStateSchema = z.object({
+  stage: z.string(),
+  goal: z.string(),
+  allowedActions: z.array(z.string()).default([]),
+  enough: z.boolean(),
+  iteration: z.number(),
+  maxIterations: z.number(),
+  checks: z.array(stageCheckItemSchema),
+  openQuestions: z.array(z.string()),
+  visitedSources: z.array(z.string()),
+});
+
+const actionHistoryItemSchema = z.object({
+  iteration: z.number(),
+  decision: z.record(z.string(), z.unknown()),
+  resolvedAction: z.record(z.string(), z.unknown()),
+  outputSummary: z.unknown(),
+});
+
 const agentRunSummarySchema = z.object({
   id: z.string(),
   agentType: z.string(),
@@ -46,6 +74,8 @@ const activeAgentRunSchema = z.object({
   currentBatchIndex: z.number(),
   currentBatchCount: z.number(),
   contextPlan: contextPlanSchema,
+  stageState: stageStateSchema.nullable().optional(),
+  actionHistory: z.array(actionHistoryItemSchema).default([]),
 });
 
 const evidenceItemSchema = z.object({
@@ -64,6 +94,15 @@ const visualDiagnosticSchema = z.object({
   retryable: z.boolean(),
 });
 
+const visualParsingSummarySchema = z.object({
+  enabled: z.boolean(),
+  figureCount: z.number(),
+  tableCount: z.number(),
+  cropSuccessCount: z.number(),
+  cropFailedCount: z.number(),
+  warnings: z.array(z.string()).default([]),
+});
+
 const parsedContentSummarySchema = z.object({
   version: z.number(),
   storagePath: z.string(),
@@ -74,11 +113,27 @@ const parsedContentSummarySchema = z.object({
   visualEnabled: z.boolean(),
   visualMode: z.string(),
   visualSummaryCount: z.number(),
+  cropSuccessCount: z.number(),
+  cropFailedCount: z.number(),
   sampleCaption: z.string().nullable(),
   sampleSummary: z.string().nullable(),
   visualWarnings: z.array(z.string()),
   githubUploadDiagnostics: z.array(visualDiagnosticSchema).default([]),
   visualDiagnostics: z.array(visualDiagnosticSchema).default([]),
+});
+
+const parsedBoundingBoxSchema = z.object({
+  x: z.number(),
+  y: z.number(),
+  width: z.number(),
+  height: z.number(),
+});
+
+const parsedObjectMentionSchema = z.object({
+  sectionId: z.string().nullable(),
+  page: z.number(),
+  locator: z.string(),
+  sentence: z.string(),
 });
 
 const parsedFigureSchema = z.object({
@@ -89,11 +144,14 @@ const parsedFigureSchema = z.object({
   page: z.number().nullable(),
   sectionId: z.string().nullable(),
   locator: z.string(),
-  imagePath: z.string(),
+  imagePath: z.string().nullable(),
   thumbnailPath: z.string().nullable(),
   ocrText: z.array(z.string()),
   summary: z.string().nullable(),
   confidence: z.number().nullable(),
+  boundingBox: parsedBoundingBoxSchema.nullable(),
+  captionBoundingBox: parsedBoundingBoxSchema.nullable(),
+  mentions: z.array(parsedObjectMentionSchema).default([]),
 });
 
 const parsedTableSchema = z.object({
@@ -104,12 +162,15 @@ const parsedTableSchema = z.object({
   page: z.number().nullable(),
   sectionId: z.string().nullable(),
   locator: z.string(),
-  imagePath: z.string(),
+  imagePath: z.string().nullable(),
   thumbnailPath: z.string().nullable(),
   ocrText: z.array(z.string()),
   markdownTable: z.string().nullable(),
   summary: z.string().nullable(),
   confidence: z.number().nullable(),
+  boundingBox: parsedBoundingBoxSchema.nullable(),
+  captionBoundingBox: parsedBoundingBoxSchema.nullable(),
+  mentions: z.array(parsedObjectMentionSchema).default([]),
 });
 
 const parsedVisualEvidenceSchema = z.object({
@@ -246,6 +307,7 @@ export const paperParseStatusResponseSchema = z.object({
   errorCode: z.string().nullable(),
   errorMessage: z.string().nullable(),
   updatedAt: z.string(),
+  visualParsing: visualParsingSummarySchema.nullable().optional(),
 });
 
 export const readerSnapshotSchema = z.object({
@@ -290,6 +352,46 @@ export const paperVisualArtifactsResponseSchema = z.object({
   visualDiagnostics: z.array(visualDiagnosticSchema).default([]),
 });
 
+const visualAnalysisTargetSchema = z.object({
+  objectId: z.string(),
+  objectType: z.string(),
+});
+
+const visualAnalysisEvidenceSchema = z.object({
+  sourceObjectId: z.string(),
+  sourceObjectType: z.string(),
+  claim: z.string(),
+  evidenceText: z.string(),
+  page: z.number().nullable(),
+  locator: z.string(),
+  confidence: z.number().nullable(),
+});
+
+export const visualAnalysisItemSchema = z.object({
+  objectId: z.string(),
+  objectType: z.string(),
+  label: z.string(),
+  title: z.string().nullable(),
+  page: z.number().nullable(),
+  locator: z.string(),
+  stage: z.string(),
+  chartType: z.string().nullable(),
+  multimodalSummary: z.string().nullable(),
+  keyFindings: z.array(z.string()).default([]),
+  evidence: z.array(visualAnalysisEvidenceSchema).default([]),
+  warnings: z.array(z.string()).default([]),
+  confidence: z.number().nullable(),
+});
+
+export const analyzeVisualsResponseSchema = z.object({
+  paperId: z.string(),
+  stage: z.string(),
+  visualMode: z.string(),
+  targets: z.array(visualAnalysisTargetSchema),
+  analyses: z.array(visualAnalysisItemSchema),
+  warnings: z.array(z.string()).default([]),
+});
+
 export const runAgentResponseSchema = z.object({
   runId: z.string(),
   status: z.string(),
@@ -305,6 +407,8 @@ export const agentRunDetailSchema = z.object({
   outputSnapshot: z.string().nullable(),
   handoffSummary: handoffSummarySchema.nullable().optional(),
   contextPlan: contextPlanSchema.nullable().optional(),
+  stageState: stageStateSchema.nullable().optional(),
+  actionHistory: z.array(actionHistoryItemSchema).default([]),
   errorCode: z.string().nullable(),
   errorMessage: z.string().nullable(),
   startedAt: z.string().nullable(),

@@ -402,6 +402,34 @@ select {
   gap: 0.45rem;
 }
 
+.runtimeChecklist,
+.runtimeHistoryList {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.runtimeCheckCard,
+.runtimeHistoryCard {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.8rem 0.85rem;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(30, 25, 20, 0.08);
+}
+
+.runtimeCheckCardDone {
+  border-left: 4px solid #165946;
+}
+
+.runtimeCheckCardTodo {
+  border-left: 4px solid rgba(30, 25, 20, 0.18);
+}
+
+.runtimeCheckCardBlocked {
+  border-left: 4px solid #9e2b25;
+}
+
 .visualPreviewCard {
   display: grid;
   gap: 0.35rem;
@@ -444,6 +472,11 @@ select {
   color: rgba(30, 25, 20, 0.68);
 }
 
+.artifactPreviewFrame {
+  position: relative;
+  width: 100%;
+}
+
 .artifactPreview {
   width: 100%;
   aspect-ratio: 1 / 1;
@@ -451,6 +484,27 @@ select {
   border-radius: 12px;
   background: rgba(30, 25, 20, 0.06);
   border: 1px solid rgba(30, 25, 20, 0.08);
+}
+
+.artifactPreviewOverlay {
+  position: absolute;
+  border: 2px solid rgba(197, 87, 32, 0.9);
+  border-radius: 10px;
+  box-shadow: 0 0 0 9999px rgba(197, 87, 32, 0.08);
+  pointer-events: none;
+}
+
+.artifactPreviewBadge {
+  position: absolute;
+  right: 0.6rem;
+  bottom: 0.6rem;
+  padding: 0.2rem 0.45rem;
+  border-radius: 999px;
+  background: rgba(30, 25, 20, 0.72);
+  color: #fffaf3;
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .artifactPreviewPlaceholder {

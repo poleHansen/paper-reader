@@ -9,6 +9,7 @@ import {
   getRecentModelConfig,
   getPaperParseStatus,
   getPaperVisualArtifacts,
+  analyzeVisuals,
   getProfile,
   getReaderSnapshot,
   importPaperFromFile,
@@ -29,6 +30,8 @@ import {
 } from '../services/commands';
 import type {
   AgentRunDetail,
+  AnalyzeVisualsResponse,
+  ActionHistoryItem,
   ConfirmPaperMetadataResponse,
   EvidenceItem,
   LibraryItem,
@@ -37,11 +40,14 @@ import type {
   ModelConfigListResponse,
   ModelConfigResponse,
   ModelConfigRequest,
+  PaperParseStatusResponse,
   PaperSearchResult,
   PaperVisualArtifactsResponse,
   ParsedFigure,
   ParsedTable,
   ReaderSnapshot,
+  StageCheckItem,
+  StageState,
   UserProfile,
   VisualDiagnostic,
 } from '../types/contracts';
@@ -102,8 +108,12 @@ export function App() {
   const [filePath, setFilePath] = useState('');
   const [paperUrl, setPaperUrl] = useState('');
   const [selectedPaperId, setSelectedPaperId] = useState<string | null>(null);
+  const [parseStatus, setParseStatus] = useState<PaperParseStatusResponse | null>(null);
   const [readerSnapshot, setReaderSnapshot] = useState<ReaderSnapshot | null>(null);
   const [visualArtifacts, setVisualArtifacts] = useState<PaperVisualArtifactsResponse | null>(null);
+  const [visualAnalysis, setVisualAnalysis] = useState<AnalyzeVisualsResponse | null>(null);
+  const [isAnalyzingVisuals, setIsAnalyzingVisuals] = useState(false);
+  const [visualQuestion, setVisualQuestion] = useState('What is the main takeaway from the most relevant figure or table?');
   const [hasProfile, setHasProfile] = useState(false);
   const [libraryFilterStatus, setLibraryFilterStatus] = useState('');
   const [libraryKeyword, setLibraryKeyword] = useState('');
@@ -116,6 +126,7 @@ export function App() {
     abstract: '',
   });
   const [activeRun, setActiveRun] = useState<AgentRunDetail | null>(null);
+  const [agentVisualMode, setAgentVisualMode] = useState('on_demand');
   const libraryHighlights = libraryItems.slice(0, 3);
   const effectiveGithubBranch = profile.githubRepoBranch?.trim() || 'main';
   const hasGithubTokenValue = Boolean(profile.githubToken?.trim() || profile.hasGithubToken);
@@ -388,6 +399,7 @@ export function App() {
       if (!result.metadataNeedsConfirmation) {
         await loadReaderSnapshot(result.paperId);
       } else {
+        setParseStatus(null);
         setReaderSnapshot(null);
         setVisualArtifacts(null);
       }
@@ -427,6 +439,7 @@ export function App() {
       if (!result.metadataNeedsConfirmation) {
         await loadReaderSnapshot(result.paperId);
       } else {
+        setParseStatus(null);
         setReaderSnapshot(null);
         setVisualArtifacts(null);
       }
@@ -439,8 +452,12 @@ export function App() {
 
   async function loadReaderSnapshot(paperId: string) {
     try {
-      const snapshot = await getReaderSnapshot({ paperId });
+      const [snapshot, status] = await Promise.all([
+        getReaderSnapshot({ paperId }),
+        getPaperParseStatus({ paperId }),
+      ]);
       setReaderSnapshot(snapshot);
+      setParseStatus(status);
       setActiveRun((current) => {
         if (current && snapshot.latestAgentRuns.some((run) => run.id === current.id)) {
           return current;
@@ -461,10 +478,13 @@ export function App() {
         setVisualArtifacts(artifacts);
       } else {
         setVisualArtifacts(null);
+        setVisualAnalysis(null);
       }
     } catch (error) {
       setStatusText(formatError(error));
+      setParseStatus(null);
       setVisualArtifacts(null);
+      setVisualAnalysis(null);
     }
   }
 
@@ -483,6 +503,7 @@ export function App() {
 
     try {
       const status = await getPaperParseStatus({ paperId: selectedPaperId });
+      setParseStatus(status);
       setStatusText(`Parse status: ${status.parseStatus} (${status.stage})`);
       await loadReaderSnapshot(selectedPaperId);
     } catch (error) {
@@ -517,6 +538,7 @@ export function App() {
         agentType,
         userQuestion: `Please run ${agentType} for the current paper and keep the output grounded in available evidence.`,
         force: false,
+        visualMode: agentVisualMode,
       });
       setStatusText(`${agentType} started`);
       const detail = await waitForAgentRun(run.runId);
@@ -525,6 +547,36 @@ export function App() {
       await loadReaderSnapshot(selectedPaperId);
     } catch (error) {
       setStatusText(formatError(error));
+    }
+  }
+
+  async function handleAnalyzeVisuals() {
+    if (!selectedPaperId) {
+      setStatusText('Open a paper before starting visual analysis');
+      return;
+    }
+
+    try {
+      setIsAnalyzingVisuals(true);
+      setStatusText('Running on-demand visual analysis...');
+      const targetIds = [
+        ...(visualArtifacts?.figures.slice(0, 2).map((item) => item.id) ?? []),
+        ...(visualArtifacts?.tables.slice(0, 1).map((item) => item.id) ?? []),
+      ];
+      const response = await analyzeVisuals({
+        paperId: selectedPaperId,
+        stage: activeRun?.handoffSummary?.stage ?? 'reader_on_demand',
+        userQuestion: visualQuestion,
+        force: true,
+        targetObjectIds: targetIds.length > 0 ? targetIds : undefined,
+        maxItems: 3,
+      });
+      setVisualAnalysis(response);
+      setStatusText(`Visual analysis finished for ${response.analyses.length} item(s)`);
+    } catch (error) {
+      setStatusText(formatError(error));
+    } finally {
+      setIsAnalyzingVisuals(false);
     }
   }
 
@@ -857,6 +909,16 @@ export function App() {
                 <p className="muted">Read the original paper on the left and review the current agent output on the right.</p>
               </div>
               <div className="row rowWrap readerHeaderActions">
+                <label className="detailLabel" htmlFor="agent-visual-mode-select">Visual mode</label>
+                <select
+                  id="agent-visual-mode-select"
+                  value={agentVisualMode}
+                  onChange={(event) => setAgentVisualMode(event.target.value)}
+                >
+                  <option value="disabled">Disabled</option>
+                  <option value="index_only">Index only</option>
+                  <option value="on_demand">On demand</option>
+                </select>
                 {readerSnapshot?.allowedActions.includes('run_quick_read') ? <button onClick={() => void handleRunAgent('quick_read')}>Quick read</button> : null}
                 {readerSnapshot?.allowedActions.includes('run_careful_read') ? <button onClick={() => void handleRunAgent('careful_read')}>Careful read</button> : null}
                 {readerSnapshot?.allowedActions.includes('run_deep_read') ? <button onClick={() => void handleRunAgent('deep_read')}>Deep read</button> : null}
@@ -931,7 +993,21 @@ export function App() {
                         <section className="readerPanel">
                           <span className="detailLabel">Running now</span>
                           <strong>{readerSnapshot.activeRun.agentType}</strong>
+                          <span>Status: {readerSnapshot.activeRun.status}</span>
                           <span>Batch {readerSnapshot.activeRun.currentBatchIndex} / {readerSnapshot.activeRun.currentBatchCount}</span>
+                          {readerSnapshot.activeRun.stageState ? renderStageState(readerSnapshot.activeRun.stageState) : null}
+                          {readerSnapshot.activeRun.actionHistory.length > 0 ? (
+                            <div className="detailGroup">
+                              <span className="detailLabel">Recent actions</span>
+                              <div className="runtimeHistoryList">
+                                {readerSnapshot.activeRun.actionHistory.slice(-3).reverse().map((item, index) => (
+                                  <article className="runtimeHistoryCard" key={`active-${item.iteration}-${index}`}>
+                                    {renderActionHistoryItem(item)}
+                                  </article>
+                                ))}
+                              </div>
+                            </div>
+                          ) : null}
                           <span>Sections: {readerSnapshot.activeRun.contextPlan.selectedSectionIds.join(', ') || 'none'}</span>
                           <span>Mode: {readerSnapshot.activeRun.contextPlan.runtimeMode} / {readerSnapshot.activeRun.contextPlan.sectionStrategy}</span>
                         </section>
@@ -970,8 +1046,22 @@ export function App() {
                                 <span className="detailLabel">Context plan</span>
                                 <span>Mode: {activeRun.contextPlan.runtimeMode}</span>
                                 <span>Strategy: {activeRun.contextPlan.sectionStrategy}</span>
+                                <span>Visuals: {activeRun.contextPlan.visualMode}</span>
                                 <p>{activeRun.contextPlan.selectionReason}</p>
                                 <span>Sections: {activeRun.contextPlan.selectedSectionIds.join(', ') || 'none'}</span>
+                              </div>
+                            ) : null}
+                            {activeRun.stageState ? renderStageState(activeRun.stageState) : null}
+                            {activeRun.actionHistory.length > 0 ? (
+                              <div className="detailGroup">
+                                <span className="detailLabel">Action history</span>
+                                <div className="runtimeHistoryList">
+                                  {activeRun.actionHistory.slice().reverse().map((item, index) => (
+                                    <article className="runtimeHistoryCard" key={`detail-${item.iteration}-${index}`}>
+                                      {renderActionHistoryItem(item)}
+                                    </article>
+                                  ))}
+                                </div>
                               </div>
                             ) : null}
                             {activeRun.status === 'failed' ? (
@@ -1056,6 +1146,7 @@ export function App() {
               </div>
               <div className="row rowWrap">
                 <button className="secondaryButton" onClick={() => setActiveView('reader')} disabled={!selectedPaperId}>Back to reader</button>
+                <button className="secondaryButton" onClick={() => void handleAnalyzeVisuals()} disabled={!selectedPaperId || isAnalyzingVisuals || !visualArtifacts}>Run on-demand visual analysis</button>
                 <button onClick={() => void handleRefreshParseStatus()} disabled={!selectedPaperId}>Refresh status</button>
               </div>
             </div>
@@ -1064,7 +1155,7 @@ export function App() {
                 <section className="readerPanel">
                   <span className="eyebrow">Overview</span>
                   <strong>
-                    Figures {readerSnapshot.parsedContent?.figureCount ?? 0} · Tables {readerSnapshot.parsedContent?.tableCount ?? 0}
+                    Figures {readerSnapshot.parsedContent?.figureCount ?? parseStatus?.visualParsing?.figureCount ?? 0} · Tables {readerSnapshot.parsedContent?.tableCount ?? parseStatus?.visualParsing?.tableCount ?? 0}
                   </strong>
                   <span>Visual mode: {readerSnapshot.parsedContent?.visualMode ?? 'disabled'}</span>
                   <span>
@@ -1074,7 +1165,22 @@ export function App() {
                         ? 'fallback extraction'
                         : 'disabled'}
                   </span>
+                  <span>Crop success: {readerSnapshot.parsedContent?.cropSuccessCount ?? parseStatus?.visualParsing?.cropSuccessCount ?? 0}</span>
+                  <span>Crop failed: {readerSnapshot.parsedContent?.cropFailedCount ?? parseStatus?.visualParsing?.cropFailedCount ?? 0}</span>
                   <span>Summaries: {readerSnapshot.parsedContent?.visualSummaryCount ?? 0}</span>
+                  {parseStatus?.visualParsing ? (
+                    <span>
+                      Status warnings: {parseStatus.visualParsing.warnings.join(' | ') || 'none'}
+                    </span>
+                  ) : null}
+                  <label className="detailLabel" htmlFor="visual-question-input">On-demand question</label>
+                  <textarea
+                    id="visual-question-input"
+                    value={visualQuestion}
+                    onChange={(event) => setVisualQuestion(event.target.value)}
+                    rows={4}
+                    placeholder="Ask the model what to focus on in the selected figures or tables"
+                  />
                   {readerSnapshot.parsedContent?.sampleCaption ? (
                     <div className="visualPreviewCard">
                       <span className="detailLabel">Sample caption</span>
@@ -1083,6 +1189,13 @@ export function App() {
                     </div>
                   ) : null}
                   <span>Warnings: {readerSnapshot.parsedContent?.visualWarnings.join(' | ') || 'none'}</span>
+                  {visualAnalysis ? (
+                    <div className="detailGroup">
+                      <span className="detailLabel">On-demand analysis</span>
+                      <span>Targets: {visualAnalysis.targets.length} · Mode: {visualAnalysis.visualMode}</span>
+                      {visualAnalysis.warnings.length > 0 ? <span>{visualAnalysis.warnings.join(' | ')}</span> : null}
+                    </div>
+                  ) : null}
                   {renderGitHubUploadDiagnostics(readerSnapshot.parsedContent?.githubUploadDiagnostics ?? [])}
                   {renderVisualDiagnostics(readerSnapshot.parsedContent?.visualDiagnostics ?? [])}
                 </section>
@@ -1111,6 +1224,22 @@ export function App() {
                                     <span>{figureSummaryMode(visualArtifacts, figure.id)}</span>
                                     <span>{displayVisualSummary(visualArtifacts, figure.id, figure.summary)}</span>
                                   </div>
+                                  {figure.boundingBox ? <span>{formatBoundingBox('Region', figure.boundingBox)}</span> : null}
+                                  {figure.captionBoundingBox ? <span>{formatBoundingBox('Caption', figure.captionBoundingBox)}</span> : null}
+                                  {figure.mentions.length > 0 ? (
+                                    <details>
+                                      <summary>Body references ({figure.mentions.length})</summary>
+                                      <div className="evidenceList">
+                                        {figure.mentions.map((mention, index) => (
+                                          <article className="evidenceCard" key={`${figure.id}-mention-${index}`}>
+                                            <strong>{mention.sectionId || 'Body reference'}</strong>
+                                            <span>{mention.locator} · p.{mention.page}</span>
+                                            <p>{mention.sentence}</p>
+                                          </article>
+                                        ))}
+                                      </div>
+                                    </details>
+                                  ) : null}
                                   {figure.ocrText.length > 0 ? (
                                     <details>
                                       <summary>OCR text</summary>
@@ -1142,6 +1271,22 @@ export function App() {
                                     <span>{figureSummaryMode(visualArtifacts, table.id)}</span>
                                     <span>{displayVisualSummary(visualArtifacts, table.id, table.summary)}</span>
                                   </div>
+                                  {table.boundingBox ? <span>{formatBoundingBox('Region', table.boundingBox)}</span> : null}
+                                  {table.captionBoundingBox ? <span>{formatBoundingBox('Caption', table.captionBoundingBox)}</span> : null}
+                                  {table.mentions.length > 0 ? (
+                                    <details>
+                                      <summary>Body references ({table.mentions.length})</summary>
+                                      <div className="evidenceList">
+                                        {table.mentions.map((mention, index) => (
+                                          <article className="evidenceCard" key={`${table.id}-mention-${index}`}>
+                                            <strong>{mention.sectionId || 'Body reference'}</strong>
+                                            <span>{mention.locator} · p.{mention.page}</span>
+                                            <p>{mention.sentence}</p>
+                                          </article>
+                                        ))}
+                                      </div>
+                                    </details>
+                                  ) : null}
                                   {table.markdownTable ? (
                                     <details>
                                       <summary>Extracted table</summary>
@@ -1170,6 +1315,22 @@ export function App() {
                                 <span>{formatVisualEvidenceMeta(item.supportLevel, item.sourceObjectType, item.sourceObjectId, item.page, item.confidence)}</span>
                                 <p>{item.evidenceText}</p>
                                 <span>{item.locator}</span>
+                              </article>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                      {visualAnalysis?.analyses.length ? (
+                        <div className="detailGroup">
+                          <span className="detailLabel">On-demand multimodal reading</span>
+                          <div className="evidenceList">
+                            {visualAnalysis.analyses.map((item) => (
+                              <article className="evidenceCard" key={`${item.objectType}-${item.objectId}`}>
+                                <strong>{item.label}</strong>
+                                <span>{item.chartType || item.objectType} · {formatArtifactMeta(item.page, item.locator, item.confidence)}</span>
+                                <p>{item.multimodalSummary || 'No multimodal summary returned.'}</p>
+                                {item.keyFindings.length > 0 ? <span>{item.keyFindings.join(' | ')}</span> : null}
+                                {item.warnings.length > 0 ? <span>{item.warnings.join(' | ')}</span> : null}
                               </article>
                             ))}
                           </div>
@@ -1422,7 +1583,8 @@ function renderPaperDocument(readerSnapshot: ReaderSnapshot) {
 }
 
 function renderVisualPreview(item: ParsedFigure | ParsedTable) {
-  const previewUrl = resolveAssetUrl(item.thumbnailPath ?? item.imagePath);
+  const previewPath = item.thumbnailPath ?? item.imagePath;
+  const previewUrl = resolveAssetUrl(previewPath);
   if (!previewUrl) {
     return (
       <div className="artifactPreview artifactPreviewPlaceholder">
@@ -1431,12 +1593,33 @@ function renderVisualPreview(item: ParsedFigure | ParsedTable) {
     );
   }
 
-  return <img className="artifactPreview" src={previewUrl} alt={item.label || item.id} />;
+  const isRegionPreview = Boolean(item.thumbnailPath);
+  const overlayBox = !isRegionPreview ? item.boundingBox : null;
+  const overlayStyle = overlayBox
+    ? {
+        left: `${Math.max(0, Math.min(100, overlayBox.x / (overlayBox.x + overlayBox.width) * 100))}%`,
+        top: `${Math.max(0, Math.min(100, overlayBox.y / (overlayBox.y + overlayBox.height) * 100))}%`,
+        width: `${Math.max(8, Math.min(100, overlayBox.width / (overlayBox.x + overlayBox.width) * 100))}%`,
+        height: `${Math.max(8, Math.min(100, overlayBox.height / (overlayBox.y + overlayBox.height) * 100))}%`,
+      }
+    : null;
+
+  return (
+    <div className="artifactPreviewFrame">
+      <img className="artifactPreview" src={previewUrl} alt={item.label || item.id} />
+      {overlayStyle ? <span className="artifactPreviewOverlay" style={overlayStyle} /> : null}
+      {isRegionPreview ? <span className="artifactPreviewBadge">Region crop</span> : null}
+    </div>
+  );
 }
 
 function formatArtifactMeta(page: number | null, locator: string, confidence: number | null) {
   const parts = [page ? `p.${page}` : null, locator || null, confidence != null ? `confidence ${Math.round(confidence * 100)}%` : null].filter(Boolean);
   return parts.join(' · ') || 'No locator';
+}
+
+function formatBoundingBox(label: string, box: { x: number; y: number; width: number; height: number }) {
+  return `${label} x:${Math.round(box.x)} y:${Math.round(box.y)} w:${Math.round(box.width)} h:${Math.round(box.height)}`;
 }
 
 function formatVisualEvidenceMeta(
@@ -1655,4 +1838,104 @@ function renderRunSnapshot(outputSnapshot: string | null) {
 function formatEvidenceMeta(item: EvidenceItem) {
   const page = item.page ? `Page ${item.page}` : 'Page n/a';
   return `${page} · ${item.locator}`;
+}
+
+function renderStageState(stageState: StageState) {
+  return (
+    <div className="detailGroup">
+      <span className="detailLabel">Loop state</span>
+      <span>{stageState.stage} · iteration {stageState.iteration} / {stageState.maxIterations}</span>
+      <p>{stageState.goal}</p>
+      <span>Enough evidence: {stageState.enough ? 'yes' : 'no'}</span>
+      {stageState.allowedActions.length > 0 ? (
+        <span>Allowed actions: {stageState.allowedActions.join(', ')}</span>
+      ) : null}
+      {stageState.checks.length > 0 ? (
+        <div className="runtimeChecklist">
+          {stageState.checks.map((item) => (
+            <article className={`runtimeCheckCard runtimeCheckCard${formatRuntimeCheckStatus(item.status)}`} key={item.id}>
+              {renderStageCheckItem(item)}
+            </article>
+          ))}
+        </div>
+      ) : null}
+      {stageState.openQuestions.length > 0 ? (
+        <div className="detailGroup">
+          <span className="detailLabel">Open questions</span>
+          <ul className="detailList">
+            {stageState.openQuestions.map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {stageState.visitedSources.length > 0 ? (
+        <span>Visited sources: {stageState.visitedSources.join(', ')}</span>
+      ) : null}
+    </div>
+  );
+}
+
+function renderStageCheckItem(item: StageCheckItem) {
+  return (
+    <>
+      <strong>{item.label}</strong>
+      <span>Status: {item.status}{item.required ? '' : ' · optional'}</span>
+      {item.note ? <p>{item.note}</p> : null}
+      {item.evidenceSourceIds.length > 0 ? (
+        <span>Evidence: {item.evidenceSourceIds.join(', ')}</span>
+      ) : null}
+    </>
+  );
+}
+
+function renderActionHistoryItem(item: ActionHistoryItem) {
+  return (
+    <>
+      <strong>Iteration {item.iteration}</strong>
+      <span>Action: {stringifyDecisionField(item.decision.action) ?? stringifyJsonValue(item.resolvedAction.action) ?? 'unknown'}</span>
+      {stringifyDecisionField(item.decision.reason) ? <p>{stringifyDecisionField(item.decision.reason)}</p> : null}
+      {stringifyJsonValue(item.resolvedAction.targetId) ? <span>Target: {stringifyJsonValue(item.resolvedAction.targetId)}</span> : null}
+      {item.outputSummary != null ? <span>Output: {stringifyJsonValue(item.outputSummary)}</span> : null}
+    </>
+  );
+}
+
+function formatRuntimeCheckStatus(status: string) {
+  switch (status) {
+    case 'done':
+      return 'Done';
+    case 'blocked':
+      return 'Blocked';
+    default:
+      return 'Todo';
+  }
+}
+
+function stringifyDecisionField(value: unknown) {
+  if (typeof value === 'string' && value.trim()) {
+    return value;
+  }
+
+  return null;
+}
+
+function stringifyJsonValue(value: unknown) {
+  if (value == null) {
+    return null;
+  }
+
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return null;
+  }
 }

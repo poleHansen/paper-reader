@@ -169,6 +169,15 @@ export type GetPaperParseStatusRequest = {
   paperId: string;
 };
 
+export type VisualParsingSummary = {
+  enabled: boolean;
+  figureCount: number;
+  tableCount: number;
+  cropSuccessCount: number;
+  cropFailedCount: number;
+  warnings: string[];
+};
+
 export type PaperParseStatusResponse = {
   paperId: string;
   parseStatus: string;
@@ -176,6 +185,7 @@ export type PaperParseStatusResponse = {
   stage: string;
   errorCode: string | null;
   errorMessage: string | null;
+  visualParsing?: VisualParsingSummary | null;
   updatedAt: string;
 };
 
@@ -225,6 +235,8 @@ export type ParsedContentSummary = {
   visualEnabled: boolean;
   visualMode: string;
   visualSummaryCount: number;
+  cropSuccessCount: number;
+  cropFailedCount: number;
   sampleCaption: string | null;
   sampleSummary: string | null;
   visualWarnings: string[];
@@ -268,6 +280,8 @@ export type ActiveAgentRun = {
   currentBatchIndex: number;
   currentBatchCount: number;
   contextPlan: ContextPlan;
+  stageState?: StageState | null;
+  actionHistory: ActionHistoryItem[];
 };
 
 export type AgentRunSummary = {
@@ -289,6 +303,48 @@ export type EvidenceItem = {
   locator: string;
 };
 
+export type StageCheckItem = {
+  id: string;
+  label: string;
+  status: string;
+  required: boolean;
+  evidenceSourceIds: string[];
+  note: string | null;
+};
+
+export type StageState = {
+  stage: string;
+  goal: string;
+  allowedActions: string[];
+  checks: StageCheckItem[];
+  visitedSources: string[];
+  openQuestions: string[];
+  iteration: number;
+  maxIterations: number;
+  enough: boolean;
+};
+
+export type ActionHistoryItem = {
+  iteration: number;
+  decision: Record<string, unknown>;
+  resolvedAction: Record<string, unknown>;
+  outputSummary?: unknown;
+};
+
+export type ParsedBoundingBox = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+export type ParsedObjectMention = {
+  sectionId: string | null;
+  page: number;
+  locator: string;
+  sentence: string;
+};
+
 export type ParsedFigure = {
   id: string;
   label: string;
@@ -297,11 +353,14 @@ export type ParsedFigure = {
   page: number | null;
   sectionId: string | null;
   locator: string;
-  imagePath: string;
+  imagePath: string | null;
   thumbnailPath: string | null;
   ocrText: string[];
   summary: string | null;
   confidence: number | null;
+  boundingBox: ParsedBoundingBox | null;
+  captionBoundingBox: ParsedBoundingBox | null;
+  mentions: ParsedObjectMention[];
 };
 
 export type ParsedTable = {
@@ -312,12 +371,15 @@ export type ParsedTable = {
   page: number | null;
   sectionId: string | null;
   locator: string;
-  imagePath: string;
+  imagePath: string | null;
   thumbnailPath: string | null;
   ocrText: string[];
   markdownTable: string | null;
   summary: string | null;
   confidence: number | null;
+  boundingBox: ParsedBoundingBox | null;
+  captionBoundingBox: ParsedBoundingBox | null;
+  mentions: ParsedObjectMention[];
 };
 
 export type ParsedVisualEvidence = {
@@ -372,6 +434,59 @@ export type RunAgentRequest = {
   maxSectionsPerBatch?: number | null;
   maxBatches?: number | null;
   pinnedSectionIds?: string[] | null;
+  visualMode?: string | null;
+  pinnedFigureIds?: string[] | null;
+  pinnedTableIds?: string[] | null;
+};
+
+export type VisualAnalysisTarget = {
+  objectId: string;
+  objectType: string;
+};
+
+export type VisualAnalysisEvidence = {
+  sourceObjectId: string;
+  sourceObjectType: string;
+  claim: string;
+  evidenceText: string;
+  page: number | null;
+  locator: string;
+  confidence: number | null;
+};
+
+export type VisualAnalysisItem = {
+  objectId: string;
+  objectType: string;
+  label: string;
+  title: string | null;
+  page: number | null;
+  locator: string;
+  stage: string;
+  chartType: string | null;
+  multimodalSummary: string | null;
+  keyFindings: string[];
+  evidence: VisualAnalysisEvidence[];
+  warnings: string[];
+  confidence: number | null;
+};
+
+export type AnalyzeVisualsRequest = {
+  paperId: string;
+  stage: string;
+  userQuestion?: string | null;
+  force?: boolean | null;
+  targetObjectIds?: string[] | null;
+  targetObjectTypes?: string[] | null;
+  maxItems?: number | null;
+};
+
+export type AnalyzeVisualsResponse = {
+  paperId: string;
+  stage: string;
+  visualMode: string;
+  targets: VisualAnalysisTarget[];
+  analyses: VisualAnalysisItem[];
+  warnings: string[];
 };
 
 export type RunAgentResponse = {
@@ -393,6 +508,8 @@ export type AgentRunDetail = {
   outputSnapshot: string | null;
   handoffSummary?: HandoffSummary | null;
   contextPlan?: ContextPlan | null;
+  stageState?: StageState | null;
+  actionHistory: ActionHistoryItem[];
   errorCode: string | null;
   errorMessage: string | null;
   startedAt: string | null;

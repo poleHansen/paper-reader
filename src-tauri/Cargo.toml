@@ -5,6 +5,10 @@ description = "Paper Reader desktop app"
 authors = ["GitHub Copilot"]
 edition = "2021"
 
+[features]
+default = []
+live-tauri-tests = []
+
 [lib]
 name = "paper_reader_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]

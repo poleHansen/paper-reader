@@ -42,6 +42,32 @@ pub struct ParsedMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ParsedBoundingBox {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedObjectMention {
+    pub section_id: Option<String>,
+    pub page: i32,
+    pub sentence: String,
+    pub locator: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedNearbyContext {
+    pub paragraph_id: String,
+    pub role: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ParsedFigure {
     pub id: String,
     pub label: String,
@@ -50,12 +76,25 @@ pub struct ParsedFigure {
     pub page: Option<i32>,
     pub section_id: Option<String>,
     pub locator: String,
-    pub image_path: String,
+    pub image_path: Option<String>,
     pub thumbnail_path: Option<String>,
     #[serde(default)]
     pub ocr_text: Vec<String>,
     pub summary: Option<String>,
     pub confidence: Option<f32>,
+    #[serde(default)]
+    pub bounding_box: Option<ParsedBoundingBox>,
+    #[serde(default)]
+    pub caption_bounding_box: Option<ParsedBoundingBox>,
+    #[serde(default)]
+    pub mentions: Vec<ParsedObjectMention>,
+    #[serde(default)]
+    pub nearby_context: Vec<ParsedNearbyContext>,
+    pub crop_status: Option<String>,
+    pub crop_quality: Option<String>,
+    pub crop_strategy: Option<String>,
+    #[serde(default)]
+    pub crop_diagnostics: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,13 +107,28 @@ pub struct ParsedTable {
     pub page: Option<i32>,
     pub section_id: Option<String>,
     pub locator: String,
-    pub image_path: String,
+    pub image_path: Option<String>,
     pub thumbnail_path: Option<String>,
     #[serde(default)]
     pub ocr_text: Vec<String>,
     pub markdown_table: Option<String>,
+    pub csv_path: Option<String>,
+    pub structured_source: Option<String>,
     pub summary: Option<String>,
     pub confidence: Option<f32>,
+    #[serde(default)]
+    pub bounding_box: Option<ParsedBoundingBox>,
+    #[serde(default)]
+    pub caption_bounding_box: Option<ParsedBoundingBox>,
+    #[serde(default)]
+    pub mentions: Vec<ParsedObjectMention>,
+    #[serde(default)]
+    pub nearby_context: Vec<ParsedNearbyContext>,
+    pub crop_status: Option<String>,
+    pub crop_quality: Option<String>,
+    pub crop_strategy: Option<String>,
+    #[serde(default)]
+    pub crop_diagnostics: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +162,10 @@ pub struct VisualParsingMetadata {
     pub asset_count: i32,
     pub figure_count: i32,
     pub table_count: i32,
+    #[serde(default)]
+    pub crop_success_count: i32,
+    #[serde(default)]
+    pub crop_failed_count: i32,
     pub multimodal_summary_count: i32,
     #[serde(default)]
     pub github_upload_diagnostics: Vec<VisualDiagnostic>,
@@ -155,4 +213,112 @@ pub struct SidecarParseMetadata {
 pub struct SidecarParseError {
     pub code: String,
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SidecarParseEnvelope;
+
+    #[test]
+    fn sidecar_parse_envelope_accepts_visual_bounding_boxes_and_mentions() {
+        let payload = r#"{
+            "success": true,
+            "data": {
+                "fullText": "Figure 2 is referenced in the body.",
+                "sections": [
+                    {
+                        "id": "sec_1",
+                        "title": "1 Method",
+                        "level": 1,
+                        "order": 1,
+                        "startPage": 1,
+                        "endPage": 1,
+                        "locator": "1",
+                        "text": "We compare the pipeline in Figure 2 against the baseline."
+                    }
+                ],
+                "metadata": {
+                    "pageCount": 2,
+                    "parser": "pypdf2+pymupdf",
+                    "visualParsing": {
+                        "enabled": true,
+                        "mode": "caption_index",
+                        "assetCount": 1,
+                        "figureCount": 1,
+                        "tableCount": 0,
+                        "cropSuccessCount": 1,
+                        "cropFailedCount": 0,
+                        "multimodalSummaryCount": 0,
+                        "githubUploadDiagnostics": [],
+                        "diagnostics": [],
+                        "warnings": []
+                    }
+                },
+                "references": [],
+                "figures": [
+                    {
+                        "id": "figure_2_1",
+                        "label": "Figure 2",
+                        "title": "System overview",
+                        "caption": "Figure 2: System overview",
+                        "page": 2,
+                        "sectionId": "sec_1",
+                        "locator": "page:2:line:1",
+                        "imagePath": "D:/tmp/figure-2.png",
+                        "thumbnailPath": "D:/tmp/figure-2-thumb.png",
+                        "ocrText": ["encoder", "decoder"],
+                        "summary": "System overview",
+                        "confidence": 0.91,
+                        "boundingBox": { "x": 60.0, "y": 150.0, "width": 280.0, "height": 190.0 },
+                        "captionBoundingBox": { "x": 60.0, "y": 348.0, "width": 210.0, "height": 22.0 },
+                        "mentions": [
+                            {
+                                "sectionId": "sec_1",
+                                "page": 1,
+                                "locator": "1",
+                                "sentence": "We compare the pipeline in Figure 2 against the baseline."
+                            }
+                        ],
+                        "nearbyContext": [
+                            {
+                                "paragraphId": "page_2_para_1",
+                                "role": "after_caption",
+                                "text": "The diagram highlights the encoder and decoder interaction."
+                            }
+                        ],
+                        "cropStatus": "success",
+                        "cropQuality": "high",
+                        "cropStrategy": "caption_anchor",
+                        "cropDiagnostics": {
+                            "candidateCount": 1
+                        }
+                    }
+                ],
+                "tables": [],
+                "visualEvidence": [
+                    {
+                        "id": "ve_figure_2_1",
+                        "sourceObjectId": "figure_2_1",
+                        "sourceObjectType": "figure",
+                        "claim": "System overview",
+                        "supportLevel": "ocr_supported",
+                        "evidenceText": "We compare the pipeline in Figure 2 against the baseline.",
+                        "page": 2,
+                        "locator": "page:2:line:1",
+                        "confidence": 0.58
+                    }
+                ]
+            },
+            "error": null
+        }"#;
+
+        let envelope: SidecarParseEnvelope = serde_json::from_str(payload).expect("payload should deserialize");
+        let data = envelope.data.expect("expected data");
+        let figure = &data.figures[0];
+
+        assert_eq!(figure.bounding_box.as_ref().expect("bbox").width, 280.0);
+        assert_eq!(figure.caption_bounding_box.as_ref().expect("caption bbox").height, 22.0);
+        assert_eq!(figure.mentions.len(), 1);
+        assert_eq!(figure.mentions[0].sentence, "We compare the pipeline in Figure 2 against the baseline.");
+    }
 }

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     errors::AppError,
-    models::runtime::{AgentRunDetailResponse, GetAgentRunRequest, RunAgentRequest, RunAgentResponse},
+    models::runtime::{AgentRunDetailResponse, AnalyzeVisualsRequest, AnalyzeVisualsResponse, GetAgentRunRequest, RunAgentRequest, RunAgentResponse},
     repositories::{database::Database, model_repository::ModelRepository, runtime_repository::RuntimeRepository},
 };
 
@@ -33,6 +33,16 @@ impl RuntimeService {
         }
         let model_config = self.model_repository.get_runtime_config(&request.agent_type)?;
         self.repository.create_run(request, &self.client, &model_config).await
+    }
+
+    pub async fn analyze_visuals(&self, request: AnalyzeVisualsRequest) -> Result<AnalyzeVisualsResponse, AppError> {
+        if request.paper_id.trim().is_empty() {
+            return Err(AppError::Validation("paperId cannot be empty".into()));
+        }
+        if request.stage.trim().is_empty() {
+            return Err(AppError::Validation("stage cannot be empty".into()));
+        }
+        self.repository.analyze_visuals(request).await
     }
 
     pub async fn get_agent_run(&self, request: GetAgentRunRequest) -> Result<AgentRunDetailResponse, AppError> {
